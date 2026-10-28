@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Symbol Render</title>
+    <style>
+      html, body { margin: 0; padding: 0; background: transparent; }
+      #wrap { width: 1024px; height: 1024px; display: flex; align-items: center; justify-content: center; }
+      img { width: 1024px; height: 1024px; }
+    </style>
+  </head>
+  <body>
+    <div id="wrap"><img id="logo" alt="" /></div>
+    <script>
+      const params = new URLSearchParams(location.search);
+      document.getElementById("logo").src = params.get("src") || "../assets/logo/titan-symbol.svg";
+    </script>
+  </body>
+</html>

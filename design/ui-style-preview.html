@@ -1,0 +1,1201 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Titan · UI 风格与主题规范预览</title>
+    <style>
+      :root {
+        --bg: #F2F4F1;
+        --bg-raised: #FBFCFA;
+        --surface-glass: rgba(251, 252, 250, 0.72);
+        --text: #152027;
+        --text-secondary: #5F6C73;
+        --text-tertiary: #8B989F;
+        --line: #E1E6E3;
+        --line-strong: #C8D0CD;
+        --accent: #0FA896;
+        --accent-ink: #0B7A70;
+        --accent-contrast: #FBFCFA;
+        --accent-soft: #E3F3F0;
+        --slate: #5F6C73;
+        --focus: #0FA896;
+        --success: #3F7A4E;
+        --warning: #A96F13;
+        --danger: #B3372B;
+        --stage: #0B1116;
+        --shadow-1: 0 1px 2px rgba(16, 24, 32, 0.06), 0 8px 24px rgba(16, 24, 32, 0.06);
+        --shadow-2: 0 2px 6px rgba(16, 24, 32, 0.08), 0 18px 48px rgba(16, 24, 32, 0.14);
+        --glass-highlight: rgba(255, 255, 255, 0.55);
+        color-scheme: light;
+      }
+
+      :root[data-theme="dark"] {
+        --bg: #101820;
+        --bg-raised: #18232D;
+        --surface-glass: rgba(24, 35, 45, 0.66);
+        --text: #F1F5F4;
+        --text-secondary: #A7B4BA;
+        --text-tertiary: #6D7B83;
+        --line: rgba(241, 245, 244, 0.12);
+        --line-strong: rgba(241, 245, 244, 0.22);
+        --accent: #2ED3BE;
+        --accent-ink: #2ED3BE;
+        --accent-contrast: #101820;
+        --accent-soft: rgba(46, 211, 190, 0.16);
+        --slate: #9AA7AE;
+        --focus: #2ED3BE;
+        --success: #5DA56E;
+        --warning: #D39B3D;
+        --danger: #E4624F;
+        --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 24px rgba(0, 0, 0, 0.28);
+        --shadow-2: 0 2px 6px rgba(0, 0, 0, 0.36), 0 18px 48px rgba(0, 0, 0, 0.44);
+        --glass-highlight: rgba(241, 245, 244, 0.1);
+        color-scheme: dark;
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Segoe UI Variable Display", "Segoe UI", Inter, "Microsoft YaHei UI", sans-serif;
+        color: var(--text);
+        background: var(--bg);
+        font-size: 14px;
+        line-height: 22px;
+        letter-spacing: 0;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+        transition: background-color 200ms ease, color 200ms ease;
+      }
+
+      button,
+      input,
+      select {
+        font: inherit;
+        letter-spacing: 0;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      :focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 2px;
+      }
+
+      .mono {
+        font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .preview-shell {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 32px 32px 64px;
+      }
+
+      .preview-header {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        height: 52px;
+        padding: 0 24px;
+        margin: -32px -32px 32px;
+        background: var(--surface-glass);
+        border-bottom: 1px solid var(--line);
+        box-shadow: inset 0 -1px 0 var(--glass-highlight);
+        backdrop-filter: blur(20px) saturate(160%);
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 16px;
+        font-weight: 600;
+      }
+
+      .brand-mark {
+        display: inline-flex;
+        color: var(--accent);
+      }
+
+      .theme-seg {
+        display: inline-flex;
+        gap: 2px;
+        padding: 2px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg-raised);
+      }
+
+      .theme-seg button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        height: 30px;
+        padding: 0 12px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text-secondary);
+        font-size: 13px;
+      }
+
+      .theme-seg button[aria-pressed="true"] {
+        background: var(--accent-soft);
+        color: var(--accent-ink);
+        font-weight: 500;
+      }
+
+      .hero {
+        padding: 8px 0 32px;
+      }
+
+      .hero h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        line-height: 36px;
+        font-weight: 600;
+      }
+
+      .hero p {
+        margin: 0;
+        max-width: 680px;
+        color: var(--text-secondary);
+      }
+
+      .section {
+        margin-top: 48px;
+      }
+
+      .section__head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 16px;
+      }
+
+      .section__head h2 {
+        margin: 0;
+        font-size: 20px;
+        line-height: 28px;
+        font-weight: 600;
+      }
+
+      .section__head .note {
+        color: var(--text-tertiary);
+        font-size: 12px;
+      }
+
+      .card {
+        background: var(--bg-raised);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow-1);
+      }
+
+      .card__pad {
+        padding: 24px;
+      }
+
+      .logo-row {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .logo-tile {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        min-height: 176px;
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg-raised);
+      }
+
+      .logo-tile--dark {
+        background: #101820;
+        border-color: rgba(241, 245, 244, 0.12);
+      }
+
+      .logo-tile--mark {
+        background: #0B7A70;
+        border-color: transparent;
+      }
+
+      .logo-tile__label {
+        color: var(--text-tertiary);
+        font-size: 12px;
+      }
+
+      .logo-tile--dark .logo-tile__label {
+        color: #6D7B83;
+      }
+
+      .logo-tile--mark .logo-tile__label {
+        color: rgba(242, 246, 244, 0.72);
+      }
+
+      .swatch-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .swatch {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg-raised);
+      }
+
+      .swatch__chip {
+        height: 64px;
+      }
+
+      .swatch__meta {
+        padding: 10px 12px;
+      }
+
+      .swatch__name {
+        font-size: 12px;
+        font-weight: 500;
+      }
+
+      .swatch__hex {
+        margin-top: 2px;
+        color: var(--text-tertiary);
+        font-size: 11px;
+        line-height: 16px;
+      }
+
+      .type-list {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .type-row {
+        display: flex;
+        align-items: baseline;
+        gap: 24px;
+        padding: 14px 24px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .type-row:last-child {
+        border-bottom: 0;
+      }
+
+      .type-row__label {
+        width: 96px;
+        flex: 0 0 96px;
+        color: var(--text-tertiary);
+        font-size: 12px;
+      }
+
+      .type-row__sample {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .type-row--display .type-row__sample {
+        font-size: 28px;
+        line-height: 36px;
+        font-weight: 600;
+      }
+
+      .type-row--title .type-row__sample {
+        font-size: 20px;
+        line-height: 28px;
+        font-weight: 600;
+      }
+
+      .type-row--heading .type-row__sample {
+        font-size: 16px;
+        line-height: 24px;
+        font-weight: 600;
+      }
+
+      .type-row--body .type-row__sample {
+        font-size: 14px;
+        line-height: 22px;
+      }
+
+      .type-row--small .type-row__sample {
+        font-size: 12px;
+        line-height: 18px;
+        color: var(--text-secondary);
+      }
+
+      .type-row--mono .type-row__sample {
+        font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+        font-size: 13px;
+        line-height: 20px;
+      }
+
+      .component-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .component-block {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .component-block__title {
+        font-size: 12px;
+        color: var(--text-tertiary);
+      }
+
+      .component-row {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        height: 36px;
+        padding: 0 16px;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        font-size: 14px;
+        font-weight: 500;
+        white-space: nowrap;
+        transition: background-color 100ms ease, border-color 100ms ease, transform 100ms ease;
+      }
+
+      .btn:active {
+        transform: scale(0.985);
+      }
+
+      .btn--primary {
+        background: var(--accent);
+        color: var(--accent-contrast);
+      }
+
+      .btn--secondary {
+        background: var(--bg-raised);
+        border-color: var(--line);
+        color: var(--text);
+      }
+
+      .btn--ghost {
+        background: transparent;
+        color: var(--text-secondary);
+      }
+
+      .icon-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        flex: 0 0 32px;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--text-secondary);
+        transition: background-color 100ms ease, color 100ms ease;
+      }
+
+      .icon-btn:hover {
+        background: var(--accent-soft);
+        color: var(--text);
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 24px;
+        padding: 0 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        line-height: 18px;
+        white-space: nowrap;
+      }
+
+      .pill--success {
+        background: rgba(63, 122, 78, 0.12);
+        color: var(--success);
+      }
+
+      .pill--accent {
+        background: var(--accent-soft);
+        color: var(--accent-ink);
+      }
+
+      .pill--warning {
+        background: rgba(169, 111, 19, 0.12);
+        color: var(--warning);
+      }
+
+      .pill--neutral {
+        background: var(--bg-raised);
+        border: 1px solid var(--line);
+        color: var(--text-secondary);
+      }
+
+      .pill__dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      .segmented {
+        display: inline-flex;
+        gap: 2px;
+        padding: 2px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg-raised);
+      }
+
+      .segmented button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        height: 30px;
+        padding: 0 12px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text-secondary);
+        font-size: 13px;
+        white-space: nowrap;
+      }
+
+      .segmented button:hover {
+        color: var(--text);
+      }
+
+      .segmented button[aria-pressed="true"] {
+        background: var(--accent-soft);
+        color: var(--accent-ink);
+        font-weight: 500;
+      }
+
+      .input {
+        height: 36px;
+        padding: 0 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg-raised);
+        color: var(--text);
+        font-size: 14px;
+      }
+
+      .input::placeholder {
+        color: var(--text-tertiary);
+      }
+
+      .switch {
+        position: relative;
+        display: inline-block;
+        width: 36px;
+        height: 20px;
+        flex: 0 0 36px;
+      }
+
+      .switch input {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        opacity: 0;
+      }
+
+      .switch__track {
+        display: block;
+        width: 36px;
+        height: 20px;
+        border-radius: 999px;
+        background: var(--line-strong);
+        transition: background-color 150ms ease;
+      }
+
+      .switch__thumb {
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 2px rgba(16, 24, 32, 0.2);
+        transition: transform 150ms ease;
+      }
+
+      .switch input:checked + .switch__track {
+        background: var(--accent);
+      }
+
+      .switch input:checked + .switch__track .switch__thumb {
+        transform: translateX(16px);
+      }
+
+      .progress {
+        width: 100%;
+        height: 4px;
+        border-radius: 999px;
+        background: var(--line);
+        overflow: hidden;
+      }
+
+      .progress__bar {
+        height: 100%;
+        border-radius: 999px;
+        background: var(--accent);
+      }
+
+      .app-mock {
+        overflow: hidden;
+      }
+
+      .mock-frame {
+        display: grid;
+        grid-template-columns: 208px minmax(0, 1fr);
+        min-height: 460px;
+      }
+
+      .mock-side {
+        padding: 16px 12px;
+        background: var(--bg-raised);
+        border-right: 1px solid var(--line);
+      }
+
+      .mock-brand {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 36px;
+        padding: 0 8px;
+        margin-bottom: 20px;
+        color: var(--accent);
+      }
+
+      .mock-brand span {
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--text);
+      }
+
+      .mock-nav-label {
+        height: 28px;
+        padding: 0 12px;
+        font-size: 11px;
+        color: var(--text-tertiary);
+      }
+
+      .mock-nav {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        height: 36px;
+        padding: 0 12px;
+        border-radius: 8px;
+        color: var(--text-secondary);
+        font-size: 14px;
+      }
+
+      .mock-nav--active {
+        position: relative;
+        background: var(--accent-soft);
+        color: var(--accent-ink);
+        font-weight: 500;
+      }
+
+      .mock-nav--active::before {
+        content: "";
+        position: absolute;
+        left: -12px;
+        top: 7px;
+        bottom: 7px;
+        width: 3px;
+        border-radius: 999px;
+        background: var(--accent);
+      }
+
+      .mock-main {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        background: var(--bg);
+      }
+
+      .mock-topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 52px;
+        padding: 0 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--surface-glass);
+        backdrop-filter: blur(20px) saturate(160%);
+        box-shadow: inset 0 -1px 0 var(--glass-highlight);
+      }
+
+      .mock-topbar__title {
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      .mock-content {
+        padding: 20px;
+      }
+
+      .mock-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 16px;
+      }
+
+      .mock-head h3 {
+        margin: 0;
+        font-size: 20px;
+        line-height: 28px;
+        font-weight: 600;
+      }
+
+      .mock-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 232px;
+        gap: 16px;
+      }
+
+      .mock-stage {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 300px;
+        border: 1px solid rgba(241, 245, 244, 0.08);
+        border-radius: 8px;
+        background: var(--stage);
+        overflow: hidden;
+      }
+
+      .mock-stage__grid {
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(rgba(241, 245, 244, 0.06) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(241, 245, 244, 0.06) 1px, transparent 1px);
+        background-size: 32px 32px;
+      }
+
+      .mock-stage__symbol {
+        position: relative;
+        color: rgba(46, 211, 190, 0.5);
+      }
+
+      .mock-stage__hud {
+        position: absolute;
+        left: 12px;
+        bottom: 12px;
+        padding: 4px 8px;
+        border-radius: 6px;
+        background: rgba(16, 24, 32, 0.72);
+        border: 1px solid rgba(241, 245, 244, 0.12);
+        color: rgba(241, 245, 244, 0.72);
+        font-size: 12px;
+      }
+
+      .mock-side-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .mock-card {
+        padding: 16px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg-raised);
+      }
+
+      .mock-card h4 {
+        margin: 0 0 10px;
+        font-size: 14px;
+        line-height: 20px;
+        font-weight: 600;
+      }
+
+      .mock-metric {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 30px;
+        font-size: 13px;
+      }
+
+      .mock-metric__label {
+        color: var(--text-secondary);
+      }
+
+      .mock-metric__value {
+        font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .mock-progress-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      @media (max-width: 860px) {
+        .logo-row,
+        .swatch-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .component-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .mock-layout {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="preview-shell">
+      <header class="preview-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 512 512" fill="none">
+              <g fill="currentColor">
+                <path d="M 0 0 H 132 V 44 H 88 V 132 H 44 V 44 H 0 Z" transform="translate(196 236)" />
+                <path d="M 0 0 L 132 0 L 180 24 L 48 24 Z" transform="translate(196 236)" opacity="0.55" />
+                <path d="M 132 0 L 180 24 L 180 68 L 132 44 Z" transform="translate(196 236)" opacity="0.3" />
+                <path d="M 88 44 L 136 68 L 136 156 L 88 132 Z" transform="translate(196 236)" opacity="0.3" />
+              </g>
+              <path d="M 113.7 209.6 A 175 175 0 0 1 458.3 209.6" stroke="currentColor" stroke-width="20" stroke-linecap="round" opacity="0.6" />
+              <circle cx="458.3" cy="209.6" r="13" fill="currentColor" opacity="0.85" />
+            </svg>
+          </span>
+          <span>Titan</span>
+        </div>
+        <div class="theme-seg" role="group" aria-label="主题切换">
+          <button type="button" data-theme-option="light" aria-pressed="true">浅色</button>
+          <button type="button" data-theme-option="dark" aria-pressed="false">深色</button>
+        </div>
+      </header>
+
+      <div class="hero">
+        <h1>UI 风格与主题规范预览</h1>
+        <p>
+          基于棱面 T Logo 推导的霜青主题，浅色冷白纸感、深色深石墨玻璃质感；
+          4pt 网格、8px 圆角、克制的强调色使用，与 Mars、Ceres、Neptune 保持同系列语言。
+        </p>
+      </div>
+
+      <section class="section">
+        <div class="section__head">
+          <h2>Logo 展示</h2>
+          <span class="note">棱面 T · 扫描轨道 · 相机点</span>
+        </div>
+        <div class="logo-row">
+          <div class="logo-tile">
+            <svg width="72" height="72" viewBox="0 0 512 512" fill="none" style="color: var(--accent)">
+              <g fill="currentColor">
+                <path d="M 0 0 H 132 V 44 H 88 V 132 H 44 V 44 H 0 Z" transform="translate(196 236)" />
+                <path d="M 0 0 L 132 0 L 180 24 L 48 24 Z" transform="translate(196 236)" opacity="0.55" />
+                <path d="M 132 0 L 180 24 L 180 68 L 132 44 Z" transform="translate(196 236)" opacity="0.3" />
+                <path d="M 88 44 L 136 68 L 136 156 L 88 132 Z" transform="translate(196 236)" opacity="0.3" />
+              </g>
+              <path d="M 113.7 209.6 A 175 175 0 0 1 458.3 209.6" stroke="currentColor" stroke-width="20" stroke-linecap="round" opacity="0.6" />
+              <circle cx="458.3" cy="209.6" r="13" fill="currentColor" opacity="0.85" />
+            </svg>
+            <span class="logo-tile__label">浅色符号</span>
+          </div>
+          <div class="logo-tile logo-tile--dark">
+            <svg width="72" height="72" viewBox="0 0 512 512" fill="none" style="color: #2ED3BE">
+              <g fill="currentColor">
+                <path d="M 0 0 H 132 V 44 H 88 V 132 H 44 V 44 H 0 Z" transform="translate(196 236)" />
+                <path d="M 0 0 L 132 0 L 180 24 L 48 24 Z" transform="translate(196 236)" opacity="0.55" />
+                <path d="M 132 0 L 180 24 L 180 68 L 132 44 Z" transform="translate(196 236)" opacity="0.3" />
+                <path d="M 88 44 L 136 68 L 136 156 L 88 132 Z" transform="translate(196 236)" opacity="0.3" />
+              </g>
+              <path d="M 113.7 209.6 A 175 175 0 0 1 458.3 209.6" stroke="currentColor" stroke-width="20" stroke-linecap="round" opacity="0.6" />
+              <circle cx="458.3" cy="209.6" r="13" fill="currentColor" opacity="0.85" />
+            </svg>
+            <span class="logo-tile__label">深色符号</span>
+          </div>
+          <div class="logo-tile logo-tile--mark">
+            <svg width="72" height="72" viewBox="0 0 1024 1024">
+              <rect x="28" y="28" width="968" height="968" rx="224" fill="#0B7A70" />
+              <g transform="translate(512 512) scale(1.8) translate(-256 -256)">
+                <path d="M 0 0 H 132 V 44 H 88 V 132 H 44 V 44 H 0 Z" transform="translate(196 236)" fill="#F2F6F4" />
+                <path d="M 0 0 L 132 0 L 180 24 L 48 24 Z" transform="translate(196 236)" fill="#F2F6F4" opacity="0.55" />
+                <path d="M 132 0 L 180 24 L 180 68 L 132 44 Z" transform="translate(196 236)" fill="#F2F6F4" opacity="0.3" />
+                <path d="M 88 44 L 136 68 L 136 156 L 88 132 Z" transform="translate(196 236)" fill="#F2F6F4" opacity="0.3" />
+                <path d="M 113.7 209.6 A 175 175 0 0 1 458.3 209.6" stroke="#F2F6F4" stroke-width="20" stroke-linecap="round" opacity="0.6" />
+                <circle cx="458.3" cy="209.6" r="13" fill="#F2F6F4" opacity="0.85" />
+              </g>
+            </svg>
+            <span class="logo-tile__label">应用图标</span>
+          </div>
+          <div class="logo-tile">
+            <span style="display:inline-flex; align-items:center; gap:10px; color: var(--text)">
+              <svg width="44" height="44" viewBox="0 0 512 512" fill="none" style="color: var(--accent)">
+                <g fill="currentColor">
+                  <path d="M 0 0 H 132 V 44 H 88 V 132 H 44 V 44 H 0 Z" transform="translate(196 236)" />
+                  <path d="M 0 0 L 132 0 L 180 24 L 48 24 Z" transform="translate(196 236)" opacity="0.55" />
+                  <path d="M 132 0 L 180 24 L 180 68 L 132 44 Z" transform="translate(196 236)" opacity="0.3" />
+                  <path d="M 88 44 L 136 68 L 136 156 L 88 132 Z" transform="translate(196 236)" opacity="0.3" />
+                </g>
+                <path d="M 113.7 209.6 A 175 175 0 0 1 458.3 209.6" stroke="currentColor" stroke-width="20" stroke-linecap="round" opacity="0.6" />
+                <circle cx="458.3" cy="209.6" r="13" fill="currentColor" opacity="0.85" />
+              </svg>
+              <span style="font-size: 24px; font-weight: 600">Titan</span>
+            </span>
+            <span class="logo-tile__label">横版字标</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section__head">
+          <h2>三维重建工作台示意</h2>
+          <span class="note">侧边栏 232px · 顶栏 52px · 场景舞台深色底</span>
+        </div>
+        <div class="card app-mock">
+          <div class="mock-frame">
+            <aside class="mock-side">
+              <div class="mock-brand">
+                <svg width="22" height="22" viewBox="0 0 512 512" fill="none">
+                  <g fill="currentColor">
+                    <path d="M 0 0 H 132 V 44 H 88 V 132 H 44 V 44 H 0 Z" transform="translate(196 236)" />
+                    <path d="M 0 0 L 132 0 L 180 24 L 48 24 Z" transform="translate(196 236)" opacity="0.55" />
+                    <path d="M 132 0 L 180 24 L 180 68 L 132 44 Z" transform="translate(196 236)" opacity="0.3" />
+                    <path d="M 88 44 L 136 68 L 136 156 L 88 132 Z" transform="translate(196 236)" opacity="0.3" />
+                  </g>
+                  <path d="M 113.7 209.6 A 175 175 0 0 1 458.3 209.6" stroke="currentColor" stroke-width="20" stroke-linecap="round" opacity="0.6" />
+                  <circle cx="458.3" cy="209.6" r="13" fill="currentColor" opacity="0.85" />
+                </svg>
+                <span>Titan</span>
+              </div>
+              <div class="mock-nav-label">工作区</div>
+              <div class="mock-nav mock-nav--active">工作台</div>
+              <div class="mock-nav">项目</div>
+              <div class="mock-nav">场景</div>
+              <div class="mock-nav">设置</div>
+            </aside>
+            <main class="mock-main">
+              <div class="mock-topbar">
+                <span class="mock-topbar__title">场景</span>
+                <span class="pill pill--success"><span class="pill__dot"></span>训练中 · 68%</span>
+              </div>
+              <div class="mock-content">
+                <div class="mock-head">
+                  <h3>客厅多视角</h3>
+                  <button class="btn btn--primary" type="button">暂停</button>
+                </div>
+                <div class="mock-layout">
+                  <div class="mock-stage">
+                    <div class="mock-stage__grid"></div>
+                    <div class="mock-stage__symbol">
+                      <svg width="96" height="96" viewBox="0 0 512 512" fill="none">
+                        <g fill="currentColor">
+                          <path d="M 0 0 H 132 V 44 H 88 V 132 H 44 V 44 H 0 Z" transform="translate(196 236)" />
+                          <path d="M 0 0 L 132 0 L 180 24 L 48 24 Z" transform="translate(196 236)" opacity="0.55" />
+                          <path d="M 132 0 L 180 24 L 180 68 L 132 44 Z" transform="translate(196 236)" opacity="0.3" />
+                          <path d="M 88 44 L 136 68 L 136 156 L 88 132 Z" transform="translate(196 236)" opacity="0.3" />
+                        </g>
+                        <path d="M 113.7 209.6 A 175 175 0 0 1 458.3 209.6" stroke="currentColor" stroke-width="20" stroke-linecap="round" opacity="0.6" />
+                        <circle cx="458.3" cy="209.6" r="13" fill="currentColor" opacity="0.85" />
+                      </svg>
+                    </div>
+                    <div class="mock-stage__hud mono">120 视图 · 8.4M 点</div>
+                  </div>
+                  <div class="mock-side-panel">
+                    <div class="mock-card">
+                      <h4>重建指标</h4>
+                      <div class="mock-metric">
+                        <span class="mock-metric__label">相机数</span>
+                        <span class="mock-metric__value">120</span>
+                      </div>
+                      <div class="mock-metric">
+                        <span class="mock-metric__label">重建点</span>
+                        <span class="mock-metric__value">8.4M</span>
+                      </div>
+                      <div class="mock-metric">
+                        <span class="mock-metric__label">PSNR</span>
+                        <span class="mock-metric__value">31.42</span>
+                      </div>
+                      <div class="mock-metric">
+                        <span class="mock-metric__label">SSIM</span>
+                        <span class="mock-metric__value">0.982</span>
+                      </div>
+                    </div>
+                    <div class="mock-card">
+                      <div class="mock-progress-label">
+                        <span>训练进度</span>
+                        <span class="mono">68%</span>
+                      </div>
+                      <div class="progress" aria-label="训练进度 68%">
+                        <div class="progress__bar" style="width: 68%"></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </main>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const root = document.documentElement;
+      const buttons = Array.from(document.querySelectorAll("[data-theme-option]"));
+      const stored = localStorage.getItem("titan.preview.theme");
+      const queryTheme = new URLSearchParams(location.search).get("theme");
+      const initial =
+        queryTheme === "dark" || queryTheme === "light"
+          ? queryTheme
+          : stored === "dark" || stored === "light"
+            ? stored
+            : "light";
+      root.setAttribute("data-theme", initial);
+      buttons.forEach((button) => {
+        const pressed = button.dataset.themeOption === initial;
+        button.setAttribute("aria-pressed", String(pressed));
+        button.addEventListener("click", () => {
+          root.setAttribute("data-theme", button.dataset.themeOption);
+          localStorage.setItem("titan.preview.theme", button.dataset.themeOption);
+          buttons.forEach((other) =>
+            other.setAttribute(
+              "aria-pressed",
+              String(other.dataset.themeOption === button.dataset.themeOption),
+            ),
+          );
+        });
+      });
+    </script>
+  </body>
+</html>
+
+      <section class="section">
+        <div class="section__head">
+          <h2>色彩令牌</h2>
+          <span class="note">主色面积不超过 10%，状态色仅用于语义</span>
+        </div>
+        <div class="swatch-grid">
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--accent)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">accent · 霜青</div>
+              <div class="swatch__hex mono">#0FA896 / #2ED3BE</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--accent-ink)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">accent-ink · 深青</div>
+              <div class="swatch__hex mono">#0B7A70 / #2ED3BE</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--accent-soft)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">accent-soft · 霜青底</div>
+              <div class="swatch__hex mono">#E3F3F0 / 16%</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--bg)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">bg · 窗口底色</div>
+              <div class="swatch__hex mono">#F2F4F1 / #101820</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--bg-raised)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">bg-raised · 卡片</div>
+              <div class="swatch__hex mono">#FBFCFA / #18232D</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--text)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">text · 主文字</div>
+              <div class="swatch__hex mono">#152027 / #F1F5F4</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--text-secondary)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">text-secondary</div>
+              <div class="swatch__hex mono">#5F6C73 / #A7B4BA</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--text-tertiary)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">text-tertiary</div>
+              <div class="swatch__hex mono">#8B989F / #6D7B83</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--success)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">success</div>
+              <div class="swatch__hex mono">#3F7A4E / #5DA56E</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--warning)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">warning</div>
+              <div class="swatch__hex mono">#A96F13 / #D39B3D</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--danger)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">danger</div>
+              <div class="swatch__hex mono">#B3372B / #E4624F</div>
+            </div>
+          </div>
+          <div class="swatch">
+            <div class="swatch__chip" style="background: var(--stage)"></div>
+            <div class="swatch__meta">
+              <div class="swatch__name">stage · 场景舞台</div>
+              <div class="swatch__hex mono">#0B1116</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section__head">
+          <h2>字体与排版</h2>
+          <span class="note">字母间距恒为 0，数字使用等宽</span>
+        </div>
+        <div class="card type-list">
+          <div class="type-row type-row--display">
+            <span class="type-row__label">Display 28/36</span>
+            <span class="type-row__sample">重建完成 · 512 万点</span>
+          </div>
+          <div class="type-row type-row--title">
+            <span class="type-row__label">Title 20/28</span>
+            <span class="type-row__sample">书房桌景</span>
+          </div>
+          <div class="type-row type-row--heading">
+            <span class="type-row__label">Heading 16/24</span>
+            <span class="type-row__sample">最近项目</span>
+          </div>
+          <div class="type-row type-row--body">
+            <span class="type-row__label">Body 14/22</span>
+            <span class="type-row__sample">64 张图片已完成配准与训练。</span>
+          </div>
+          <div class="type-row type-row--small">
+            <span class="type-row__label">Small 12/18</span>
+            <span class="type-row__sample">昨天 16:40 · 待处理</span>
+          </div>
+          <div class="type-row type-row--mono">
+            <span class="type-row__label">Mono 13/20</span>
+            <span class="type-row__sample">PSNR 31.42 · SSIM 0.982 · 18:42</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section__head">
+          <h2>组件</h2>
+          <span class="note">按钮 36px、图标 32px、胶囊 24px、圆角 8px</span>
+        </div>
+        <div class="component-grid">
+          <div class="component-block">
+            <span class="component-block__title">按钮</span>
+            <div class="component-row">
+              <button class="btn btn--primary" type="button">开始重建</button>
+              <button class="btn btn--secondary" type="button">导入图片</button>
+              <button class="btn btn--ghost" type="button">取消</button>
+            </div>
+          </div>
+          <div class="component-block">
+            <span class="component-block__title">状态胶囊</span>
+            <div class="component-row">
+              <span class="pill pill--success"><span class="pill__dot"></span>已完成</span>
+              <span class="pill pill--accent"><span class="pill__dot"></span>训练中</span>
+              <span class="pill pill--warning"><span class="pill__dot"></span>低置信度</span>
+              <span class="pill pill--neutral">待处理</span>
+            </div>
+          </div>
+          <div class="component-block">
+            <span class="component-block__title">分段控件</span>
+            <div class="component-row">
+              <div class="segmented" role="group" aria-label="视图模式">
+                <button type="button" aria-pressed="true">网格</button>
+                <button type="button" aria-pressed="false">纹理</button>
+                <button type="button" aria-pressed="false">线框</button>
+              </div>
+            </div>
+          </div>
+          <div class="component-block">
+            <span class="component-block__title">输入与开关</span>
+            <div class="component-row">
+              <input class="input" type="text" placeholder="搜索项目" aria-label="搜索项目" />
+              <label class="switch" aria-label="自动保存">
+                <input type="checkbox" checked />
+                <span class="switch__track"><span class="switch__thumb"></span></span>
+              </label>
+            </div>
+          </div>
+          <div class="component-block">
+            <span class="component-block__title">进度</span>
+            <div class="component-row">
+              <div class="progress" aria-label="训练进度 68%">
+                <div class="progress__bar" style="width: 68%"></div>
+              </div>
+            </div>
+          </div>
+          <div class="component-block">
+            <span class="component-block__title">图标按钮</span>
+            <div class="component-row">
+              <button class="icon-btn" type="button" aria-label="帮助">?</button>
+              <button class="icon-btn" type="button" aria-label="设置">≡</button>
+            </div>
+          </div>
+        </div>
+      </section>

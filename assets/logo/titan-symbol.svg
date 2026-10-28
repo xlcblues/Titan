@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Titan symbol">
+  <g>
+    <path d="M 0 0 H 132 V 44 H 88 V 132 H 44 V 44 H 0 Z" transform="translate(196 236)" fill="#0FA896"/>
+    <path d="M 0 0 L 132 0 L 180 24 L 48 24 Z" transform="translate(196 236)" fill="#0FA896" opacity="0.55"/>
+    <path d="M 132 0 L 180 24 L 180 68 L 132 44 Z" transform="translate(196 236)" fill="#0FA896" opacity="0.3"/>
+    <path d="M 88 44 L 136 68 L 136 156 L 88 132 Z" transform="translate(196 236)" fill="#0FA896" opacity="0.3"/>
+    <path d="M 113.7 209.6 A 175 175 0 0 1 458.3 209.6" fill="none" stroke="#0FA896" stroke-width="20" stroke-linecap="round" opacity="0.6"/>
+    <circle cx="458.3" cy="209.6" r="13" fill="#0FA896" opacity="0.85"/>
+  </g>
+</svg>

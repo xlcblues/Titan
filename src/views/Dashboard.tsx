@@ -6,48 +6,32 @@ import {
   ScanLine,
   Upload,
 } from "lucide-react";
+import { useState } from "react";
+import { CreateProjectDialog } from "../components/CreateProjectDialog";
 import { StatusPill } from "../components/StatusPill";
 import { useAppInfo } from "../hooks/useAppInfo";
-
-const RECENT_PROJECTS = [
-  {
-    id: "p-01",
-    name: "书房桌景",
-    images: 64,
-    status: "已完成",
-    tone: "success" as const,
-    updated: "今天 10:24",
-  },
-  {
-    id: "p-02",
-    name: "客厅多视角",
-    images: 120,
-    status: "训练中",
-    tone: "accent" as const,
-    updated: "昨天 16:40",
-  },
-  {
-    id: "p-03",
-    name: "产品白底组",
-    images: 32,
-    status: "待处理",
-    tone: "neutral" as const,
-    updated: "10 月 24 日",
-  },
-];
+import { useProjects } from "../hooks/useProjects";
+import { formatUpdated, projectStatusMeta } from "../utils/projectMeta";
 
 export function Dashboard() {
   const info = useAppInfo();
+  const { projects, loading, error, createProject } = useProjects();
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const recent = projects.slice(0, 3);
 
   return (
     <>
       <div className="page-header">
         <h1>工作台</h1>
         <div className="page-header__actions">
-          <Link className="btn btn--primary" to="/projects">
+          <button
+            className="btn btn--primary"
+            type="button"
+            onClick={() => setDialogOpen(true)}
+          >
             <Plus size={16} />
             新建项目
-          </Link>
+          </button>
         </div>
       </div>
 
@@ -60,10 +44,14 @@ export function Dashboard() {
             <div className="quick-start__text">
               <h2 className="quick-start__title">新建重建项目</h2>
             </div>
-            <Link className="btn btn--primary" to="/projects">
+            <button
+              className="btn btn--primary"
+              type="button"
+              onClick={() => setDialogOpen(true)}
+            >
               <FolderKanban size={16} />
               创建项目
-            </Link>
+            </button>
           </section>
 
           <section className="panel">
@@ -75,26 +63,54 @@ export function Dashboard() {
               </Link>
             </div>
             <div className="panel__body">
-              {RECENT_PROJECTS.map((project) => (
-                <Link
-                  key={project.id}
-                  className="row"
-                  to="/scene"
-                  aria-label={`打开项目 ${project.name}`}
-                >
-                  <span className="row__icon" aria-hidden="true">
-                    <FolderKanban size={16} />
-                  </span>
-                  <span className="row__main">
-                    <span className="row__name">{project.name}</span>
-                    <span className="row__meta mono">
-                      {project.images} 张图片
-                    </span>
-                  </span>
-                  <StatusPill tone={project.tone} label={project.status} />
-                  <span className="row__time">{project.updated}</span>
-                </Link>
-              ))}
+              {error ? (
+                <div className="empty-state">
+                  <span>读取项目失败：{error}</span>
+                </div>
+              ) : loading ? (
+                <div className="empty-state">
+                  <span>正在读取项目</span>
+                </div>
+              ) : recent.length === 0 ? (
+                <div className="empty-state">
+                  <FolderKanban size={24} className="empty-state__icon" />
+                  <span>还没有项目</span>
+                  <button
+                    className="btn"
+                    type="button"
+                    onClick={() => setDialogOpen(true)}
+                  >
+                    <Plus size={16} />
+                    创建第一个项目
+                  </button>
+                </div>
+              ) : (
+                recent.map((project) => {
+                  const status = projectStatusMeta(project.status);
+                  return (
+                    <Link
+                      key={project.id}
+                      className="row"
+                      to={`/projects/${encodeURIComponent(project.id)}`}
+                      aria-label={`打开项目 ${project.name}`}
+                    >
+                      <span className="row__icon" aria-hidden="true">
+                        <FolderKanban size={16} />
+                      </span>
+                      <span className="row__main">
+                        <span className="row__name">{project.name}</span>
+                        <span className="row__meta mono">
+                          {project.imageCount} 张图片
+                        </span>
+                      </span>
+                      <StatusPill tone={status.tone} label={status.label} />
+                      <span className="row__time">
+                        {formatUpdated(project.updatedAt)}
+                      </span>
+                    </Link>
+                  );
+                })
+              )}
             </div>
           </section>
         </div>
@@ -136,6 +152,12 @@ export function Dashboard() {
           </section>
         </div>
       </div>
+
+      <CreateProjectDialog
+        open={dialogOpen}
+        onClose={() => setDialogOpen(false)}
+        onSubmit={(name) => createProject(name)}
+      />
     </>
   );
 }

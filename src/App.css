@@ -542,9 +542,6 @@
 
 .scene-stage {
   position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   min-height: 0;
   border: 1px solid rgba(241, 245, 244, 0.08);
   border-radius: 8px;
@@ -552,58 +549,63 @@
   overflow: hidden;
 }
 
-.scene-stage__inner {
-  position: relative;
-  width: min(100%, 720px);
-  aspect-ratio: 16 / 9;
-}
-
-.scene-grid {
+.scene-canvas {
   position: absolute;
   inset: 0;
-  background-image:
-    linear-gradient(rgba(241, 245, 244, 0.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(241, 245, 244, 0.06) 1px, transparent 1px);
-  background-size: 32px 32px;
 }
 
-.scene-symbol {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: rgba(46, 211, 190, 0.45);
+.scene-canvas canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
-.scene-hint {
-  position: absolute;
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: rgba(16, 24, 32, 0.72);
-  border: 1px solid rgba(241, 245, 244, 0.12);
-  color: var(--text-secondary);
-}
-
+.scene-selection,
+.scene-chip,
 .scene-hud,
 .scene-ratio {
   position: absolute;
-  bottom: 12px;
-  padding: 4px 8px;
+  padding: 4px 10px;
   border-radius: 6px;
   background: rgba(16, 24, 32, 0.72);
   border: 1px solid rgba(241, 245, 244, 0.12);
-  color: rgba(241, 245, 244, 0.72);
+  color: rgba(241, 245, 244, 0.78);
   font-size: 12px;
   line-height: 18px;
+  white-space: nowrap;
+  backdrop-filter: blur(8px);
+}
+
+.scene-selection {
+  top: 12px;
+  left: 12px;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.scene-chip {
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.scene-chip__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
 .scene-hud {
+  bottom: 12px;
   left: 12px;
 }
 
 .scene-ratio {
+  bottom: 12px;
   right: 12px;
 }
 
@@ -828,8 +830,8 @@
     height: auto;
   }
 
-  .scene-stage__inner {
-    width: min(100%, 560px);
+  .scene-stage {
+    min-height: 420px;
   }
 }
 

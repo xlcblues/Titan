@@ -1,3 +1,4 @@
+import { useCallback, useState } from "react";
 import {
   Boxes,
   Camera,
@@ -5,32 +6,45 @@ import {
   Grid3x3,
   Play,
   Upload,
+  type LucideIcon,
 } from "lucide-react";
-import { LogoMark } from "../components/Logo";
+import { SceneCanvas, type SceneStats } from "../components/SceneCanvas";
 import { StatusPill } from "../components/StatusPill";
+import type { SceneMode } from "../lib/demoScene";
 
-const MODES = [
+const MODES: { value: SceneMode; label: string; icon: LucideIcon }[] = [
   { value: "camera", label: "相机路径", icon: Camera },
   { value: "points", label: "点云", icon: Grid3x3 },
   { value: "mesh", label: "网格", icon: Boxes },
-] as const;
+];
 
 const TASKS = [
-  { name: "SfM 位姿估计", status: "等待", tone: "neutral" as const },
-  { name: "TFRF 训练", status: "等待", tone: "neutral" as const },
+  { name: "SfM 位姿估计", status: "完成", tone: "success" as const },
+  { name: "TFRF 训练", status: "进行中", tone: "accent" as const },
   { name: "渲染导出", status: "等待", tone: "neutral" as const },
 ];
 
 export function Scene() {
+  const [mode, setMode] = useState<SceneMode>("points");
+  const [stats, setStats] = useState<SceneStats>({
+    pointCount: 0,
+    cameraCount: 0,
+    selected: null,
+    fps: 0,
+  });
+  const handleStats = useCallback((next: SceneStats) => setStats(next), []);
+  const activeMode = MODES.find((item) => item.value === mode) ?? MODES[0];
+
   return (
     <>
       <div className="scene-toolbar">
         <div className="segmented" role="group" aria-label="场景显示模式">
-          {MODES.map(({ value, label, icon: Icon }, index) => (
+          {MODES.map(({ value, label, icon: Icon }) => (
             <button
               key={value}
               type="button"
-              aria-pressed={index === 0}
+              aria-pressed={mode === value}
+              onClick={() => setMode(value)}
               title={label}
             >
               <Icon size={16} />
@@ -55,7 +69,7 @@ export function Scene() {
         <section className="panel scene-panel">
           <div className="panel__header">
             <h2 className="panel__title">任务</h2>
-            <StatusPill tone="neutral" label="未开始" />
+            <StatusPill tone="accent" label="预览中" />
           </div>
           <div className="panel__body task-list">
             {TASKS.map((task) => (
@@ -69,18 +83,20 @@ export function Scene() {
           </div>
         </section>
 
-        <section className="scene-stage" aria-label="场景画布">
-          <div className="scene-stage__inner">
-            <div className="scene-grid" aria-hidden="true" />
-            <div className="scene-symbol" aria-hidden="true">
-              <LogoMark size={72} />
-            </div>
-            <span className="pill scene-hint">暂无场景数据</span>
-            <span className="scene-hud mono">
-              0 相机 · 0 点 · 0 步
-            </span>
-            <span className="scene-ratio mono">16:9</span>
-          </div>
+        <section className="scene-stage" aria-label="三维重建场景">
+          <SceneCanvas mode={mode} onStats={handleStats} />
+          <span className="scene-selection mono">
+            选中 {stats.selected ?? "—"}
+          </span>
+          <span className="scene-chip">
+            <span className="scene-chip__dot" aria-hidden="true" />
+            {activeMode.label}
+          </span>
+          <span className="scene-hud mono">
+            {stats.cameraCount} 相机 · {stats.pointCount.toLocaleString()} 点 ·{" "}
+            {Math.round(stats.fps)} FPS
+          </span>
+          <span className="scene-ratio mono">TITAN M3</span>
         </section>
 
         <div className="scene-side">
@@ -101,6 +117,10 @@ export function Scene() {
                 <span className="metric-row__label">混合精度</span>
                 <span className="metric-row__value mono">FP16</span>
               </div>
+              <div className="metric-row">
+                <span className="metric-row__label">显存预算</span>
+                <span className="metric-row__value mono">8 GB</span>
+              </div>
             </div>
           </section>
 
@@ -110,25 +130,33 @@ export function Scene() {
             </div>
             <div className="metric-list">
               <div className="metric-row">
-                <span className="metric-row__label">PSNR</span>
-                <span className="metric-row__value mono">—</span>
+                <span className="metric-row__label">点云</span>
+                <span className="metric-row__value mono">
+                  {stats.pointCount.toLocaleString()}
+                </span>
               </div>
               <div className="metric-row">
-                <span className="metric-row__label">SSIM</span>
-                <span className="metric-row__value mono">—</span>
+                <span className="metric-row__label">相机</span>
+                <span className="metric-row__value mono">
+                  {stats.cameraCount}
+                </span>
               </div>
               <div className="metric-row">
-                <span className="metric-row__label">显存</span>
-                <span className="metric-row__value mono">0 MB</span>
+                <span className="metric-row__label">选中点</span>
+                <span className="metric-row__value mono">
+                  {stats.selected ?? "—"}
+                </span>
               </div>
               <div className="metric-row">
-                <span className="metric-row__label">剩余时间</span>
-                <span className="metric-row__value mono">—</span>
+                <span className="metric-row__label">FPS</span>
+                <span className="metric-row__value mono">
+                  {Math.round(stats.fps)}
+                </span>
               </div>
             </div>
             <div className="metric-progress">
-              <div className="progress" role="progressbar" aria-valuenow={0} aria-valuemin={0} aria-valuemax={100}>
-                <div className="progress__bar" style={{ width: "0%" }} />
+              <div className="progress" role="progressbar" aria-valuenow={32} aria-valuemin={0} aria-valuemax={100}>
+                <div className="progress__bar" style={{ width: "32%" }} />
               </div>
             </div>
           </section>

@@ -128,8 +128,47 @@ impl Db {
             ",
         )
         .map_err(|error| error.to_string())?;
+        ensure_task_columns(&conn)?;
         Ok(Self(Mutex::new(conn)))
     }
+}
+
+fn ensure_task_columns(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(tasks)")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?;
+    let existing: Vec<String> = rows
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())?;
+
+    const MIGRATIONS: &[(&str, &str)] = &[
+        ("stage", "TEXT NOT NULL DEFAULT 'data'"),
+        ("progress", "REAL NOT NULL DEFAULT 0"),
+        ("started_at", "INTEGER"),
+        ("finished_at", "INTEGER"),
+        ("error", "TEXT"),
+        ("latest_json", "TEXT"),
+        ("config_json", "TEXT"),
+    ];
+
+    for (column, definition) in MIGRATIONS {
+        if existing
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(column))
+        {
+            continue;
+        }
+        conn.execute(
+            &format!("ALTER TABLE tasks ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
 }
 
 fn now_millis() -> i64 {
@@ -980,4 +1019,58 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_upgrades_legacy_task_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "titan-legacy-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = Connection::open(&path).expect("open legacy db");
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                   id TEXT PRIMARY KEY,
+                   project_id TEXT NOT NULL,
+                   type TEXT NOT NULL,
+                   status TEXT NOT NULL
+                 );
+                 INSERT INTO tasks (id, project_id, type, status)
+                 VALUES ('t1', 'p1', 'reconstruction', 'running');",
+            )
+            .expect("create legacy tasks");
+        }
+
+        let db = Db::open(&path).expect("migrate legacy db");
+        let conn = db.0.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT stage, progress, config_json, latest_json
+                 FROM tasks WHERE id = ?1",
+                ["t1"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .expect("query migrated columns");
+
+        assert_eq!(row.0, "data");
+        assert_eq!(row.1, 0.0);
+        assert!(row.2.is_none());
+        assert!(row.3.is_none());
+
+        drop(conn);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
 }

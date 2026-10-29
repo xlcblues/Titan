@@ -1,13 +1,19 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::Mutex,
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +52,23 @@ struct ImageRecord {
     sort_order: i64,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TaskInfo {
+    id: String,
+    project_id: String,
+    kind: String,
+    status: String,
+    stage: String,
+    progress: f64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+    error: Option<String>,
+    latest: Option<Value>,
+}
+
+struct TaskRegistry(Mutex<HashMap<String, Child>>);
+
 struct Db(Mutex<Connection>);
 
 impl Db {
@@ -83,10 +106,13 @@ impl Db {
               project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
               type TEXT NOT NULL,
               status TEXT NOT NULL,
+              stage TEXT NOT NULL DEFAULT 'data',
               progress REAL NOT NULL DEFAULT 0,
               started_at INTEGER,
               finished_at INTEGER,
-              error TEXT
+              error TEXT,
+              latest_json TEXT,
+              config_json TEXT
             );
             CREATE TABLE IF NOT EXISTS metrics (
               id TEXT PRIMARY KEY,
@@ -111,6 +137,57 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path().app_data_dir().map_err(|error| error.to_string())
+}
+
+fn project_dir(app: &tauri::AppHandle, project_id: &str) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join("projects").join(project_id))
+}
+
+fn task_project_id(app: &tauri::AppHandle, task_id: &str) -> Result<String, String> {
+    let db = app.state::<Db>();
+    let conn = db.0.lock().unwrap();
+    conn.query_row(
+        "SELECT project_id FROM tasks WHERE id = ?1",
+        [task_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn resolve_python() -> Result<String, String> {
+    if let Ok(custom) = std::env::var("TITAN_PYTHON") {
+        if Path::new(&custom).exists() {
+            return Ok(custom);
+        }
+    }
+    let candidates = ["python", "python3"];
+    for candidate in candidates {
+        let mut command = Command::new(candidate);
+        command.arg("-c").arg("import sys; print(sys.version_info[0], end='')");
+        if command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .and_then(|mut child| child.wait())
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            return Ok(candidate.to_string());
+        }
+    }
+    Err("未找到 Python 环境，请安装 Python 3.10+ 并配置 TITAN_PYTHON 环境变量".into())
+}
+
+fn write_control(project_dir: &Path, command: &str) -> Result<(), String> {
+    fs::create_dir_all(project_dir).map_err(|error| error.to_string())?;
+    let payload = json!({ "command": command, "at": now_millis() });
+    let raw = serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?;
+    fs::write(project_dir.join("control.json"), raw).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -350,6 +427,527 @@ fn list_images(db: State<'_, Db>, project_id: String) -> Result<Vec<ImageRecord>
     Ok(images)
 }
 
+fn update_task_from_payload(app: &tauri::AppHandle, task_id: &str, payload: &Value) {
+    let status = payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("running")
+        .to_string();
+    let stage = payload
+        .get("stage")
+        .and_then(|value| value.as_str())
+        .unwrap_or("running")
+        .to_string();
+    let progress = payload
+        .get("progress")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    let error = payload
+        .get("error")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let now = now_millis();
+    let project_status = match status.as_str() {
+        "done" => "done",
+        "failed" | "cancelled" => "idle",
+        _ => "active",
+    };
+    let latest = payload
+        .get("metrics")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.last())
+        .cloned()
+        .or_else(|| {
+            payload.get("loss").or_else(|| payload.get("psnr")).and_then(|_| {
+                let mut item = payload.clone();
+                item.as_object_mut().map(|map| {
+                    map.remove("taskId");
+                    map.remove("status");
+                    map.remove("stage");
+                    map.remove("progress");
+                    map.remove("metrics");
+                });
+                Some(item)
+            })
+        });
+
+    let db = app.state::<Db>();
+    let conn = db.0.lock().unwrap();
+    let _ = conn.execute(
+        "UPDATE tasks
+         SET status = ?1,
+           stage = ?2,
+           progress = ?3,
+           finished_at = CASE WHEN ?1 IN ('done', 'failed', 'cancelled') THEN ?4 ELSE finished_at END,
+           error = ?5,
+           latest_json = ?6
+         WHERE id = ?7",
+        params![
+            status,
+            stage,
+            progress,
+            now,
+            error,
+            latest.as_ref().map(|value| value.to_string()),
+            task_id
+        ],
+    );
+    let _ = conn.execute(
+        "UPDATE projects
+         SET status = ?1, updated_at = ?2
+         WHERE id = (SELECT project_id FROM tasks WHERE id = ?3)",
+        params![project_status, now, task_id],
+    );
+
+    if let Some(items) = payload.get("metrics").and_then(|value| value.as_array()) {
+        let stmt = conn
+            .prepare(
+                "INSERT OR IGNORE INTO metrics
+                 (id, task_id, step, psnr, ssim, lpips, loss, vram_mb, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .ok();
+        if let Some(mut stmt) = stmt {
+            for item in items {
+                let Some(step) = item.get("step").and_then(|value| value.as_i64()) else {
+                    continue;
+                };
+                let id = format!("{task_id}-{step}");
+                let _ = stmt.execute(params![
+                    id,
+                    task_id,
+                    step,
+                    item.get("psnr").and_then(|value| value.as_f64()),
+                    item.get("ssim").and_then(|value| value.as_f64()),
+                    item.get("lpips").and_then(|value| value.as_f64()),
+                    item.get("loss").and_then(|value| value.as_f64()),
+                    item.get("vramMB").and_then(|value| value.as_i64()),
+                    now,
+                ]);
+            }
+        }
+    }
+}
+
+fn mark_task_failed(app: &tauri::AppHandle, task_id: &str, message: &str) {
+    let payload = json!({
+        "taskId": task_id,
+        "status": "failed",
+        "stage": "error",
+        "progress": 0.0,
+        "error": message,
+    });
+    update_task_from_payload(app, task_id, &payload);
+    let _ = app.emit("titan://task", payload);
+}
+
+fn spawn_task_watcher(app: tauri::AppHandle, task_id: String, project_dir: PathBuf) {
+    thread::spawn(move || {
+        let status_path = project_dir.join("status.json");
+        let mut last_raw: Option<String> = None;
+        loop {
+            if let Ok(raw) = fs::read_to_string(&status_path) {
+                if last_raw.as_deref() != Some(raw.as_str()) {
+                    if let Ok(payload) = serde_json::from_str::<Value>(&raw) {
+                        last_raw = Some(raw);
+                        update_task_from_payload(&app, &task_id, &payload);
+                        let _ = app.emit("titan://task", payload);
+                    }
+                }
+            }
+
+            let exited = {
+                let registry = app.state::<TaskRegistry>();
+                let mut guard = registry.0.lock().unwrap();
+                match guard.get_mut(&task_id) {
+                    Some(child) => child
+                        .try_wait()
+                        .map(|status| status.is_some())
+                        .unwrap_or(true),
+                    None => true,
+                }
+            };
+
+            if !exited {
+                thread::sleep(std::time::Duration::from_millis(400));
+                continue;
+            }
+
+            let final_payload: Option<Value> = fs::read_to_string(&status_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok());
+            let terminal = final_payload
+                .as_ref()
+                .and_then(|payload| payload.get("status"))
+                .and_then(|value| value.as_str())
+                .map(|status| matches!(status, "done" | "failed" | "cancelled"))
+                .unwrap_or(false);
+
+            if let Some(payload) = final_payload {
+                update_task_from_payload(&app, &task_id, &payload);
+                let _ = app.emit("titan://task", payload);
+            }
+
+            if !terminal {
+                let db = app.state::<Db>();
+                let db_status: Option<String> = db
+                    .0
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT status FROM tasks WHERE id = ?1",
+                        [&task_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if db_status.as_deref() == Some("cancelled") {
+                    let payload = json!({
+                        "taskId": task_id,
+                        "status": "cancelled",
+                        "stage": "cancel",
+                        "progress": 0.0,
+                        "error": "用户取消",
+                    });
+                    update_task_from_payload(&app, &task_id, &payload);
+                    let _ = app.emit("titan://task", payload);
+                } else {
+                    mark_task_failed(&app, &task_id, "任务被停止或引擎异常退出");
+                }
+            }
+
+            app.state::<TaskRegistry>()
+                .0
+                .lock()
+                .unwrap()
+                .remove(&task_id);
+            break;
+        }
+    });
+}
+
+#[tauri::command]
+fn get_task(db: State<'_, Db>, project_id: String) -> Result<Option<TaskInfo>, String> {
+    let conn = db.0.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+               id,
+               project_id,
+               type,
+               status,
+               stage,
+               progress,
+               started_at,
+               finished_at,
+               error,
+               latest_json
+             FROM tasks
+             WHERE project_id = ?1
+             ORDER BY started_at DESC
+             LIMIT 1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([&project_id], |row| {
+            Ok(TaskInfo {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                kind: row.get(2)?,
+                status: row.get(3)?,
+                stage: row.get(4)?,
+                progress: row.get(5)?,
+                started_at: row.get(6)?,
+                finished_at: row.get(7)?,
+                error: row.get(8)?,
+                latest: row
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    let mut task = rows
+        .into_iter()
+        .next()
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if let Some(ref mut current) = task {
+        if current.latest.is_none() {
+            current.latest = conn
+                .query_row(
+                    "SELECT psnr, ssim, loss, vram_mb
+                     FROM metrics
+                     WHERE task_id = ?1
+                     ORDER BY step DESC
+                     LIMIT 1",
+                    [&current.id],
+                    |row| {
+                        Ok(json!({
+                            "psnr": row.get::<_, Option<f64>>(0)?,
+                            "ssim": row.get::<_, Option<f64>>(1)?,
+                            "loss": row.get::<_, Option<f64>>(2)?,
+                            "vramMB": row.get::<_, Option<i64>>(3)?,
+                        }))
+                    },
+                )
+                .ok();
+        }
+    }
+    Ok(task)
+}
+
+#[tauri::command]
+fn start_reconstruction(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    project_id: String,
+    config: Option<serde_json::Value>,
+) -> Result<TaskInfo, String> {
+    let conn = db.0.lock().unwrap();
+    let image_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM images WHERE project_id = ?1",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if image_count == 0 {
+        return Err("请先导入图片再开始重建".into());
+    }
+
+    let project_dir = project_dir(&app, &project_id)?;
+    fs::create_dir_all(&project_dir).map_err(|error| error.to_string())?;
+
+    let mut paths = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT path FROM images WHERE project_id = ?1 ORDER BY sort_order")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([&project_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            paths.push(row.map_err(|error| error.to_string())?);
+        }
+    }
+    let inputs = json!({ "images": paths });
+    fs::write(
+        project_dir.join("inputs.json"),
+        serde_json::to_string_pretty(&inputs).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut merged = json!({
+        "engine": "facets",
+        "resolution": 256,
+        "steps": 600,
+        "train_views": 16,
+        "patch_size": 2048,
+        "eval_every": 50,
+        "learning_rate": 0.02,
+        "gpu_budget": 8
+    });
+    if let Some(user_config) = config {
+        if let Some(object) = user_config.as_object() {
+            for (key, value) in object {
+                merged[key] = value.clone();
+            }
+        }
+    }
+
+    let engine_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("无法定位引擎目录")?
+        .join("python");
+    if !engine_root.join("titan_engine").join("main.py").exists() {
+        return Err(format!("未找到 Python 引擎：{}", engine_root.display()));
+    }
+    let python = resolve_python()?;
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let now = now_millis();
+    let config_raw = merged.to_string();
+    conn.execute(
+        "INSERT INTO tasks
+           (id, project_id, type, status, stage, progress, started_at, config_json)
+         VALUES (?1, ?2, 'reconstruction', 'running', 'data', 0.01, ?3, ?4)",
+        params![task_id, project_id, now, config_raw],
+    )
+    .map_err(|error| error.to_string())?;
+    conn.execute(
+        "UPDATE projects SET status = 'active', updated_at = ?1 WHERE id = ?2",
+        params![now, project_id],
+    )
+    .map_err(|error| error.to_string())?;
+
+    let config_arg = merged.to_string();
+    let project_arg = project_dir.to_string_lossy().into_owned();
+    let task_arg = task_id.clone();
+    let stdout_file = fs::File::create(project_dir.join("engine.log"))
+        .map_err(|error| format!("无法创建引擎日志：{error}"))?;
+    let stderr_file = fs::File::create(project_dir.join("engine.error.log"))
+        .map_err(|error| format!("无法创建引擎错误日志：{error}"))?;
+    let mut command = Command::new(&python);
+    command
+        .arg("-m")
+        .arg("titan_engine.main")
+        .arg("--project-dir")
+        .arg(&project_arg)
+        .arg("--task-id")
+        .arg(&task_arg)
+        .arg("--config-json")
+        .arg(&config_arg)
+        .current_dir(&engine_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+
+    let child = command.spawn().map_err(|error| {
+        let _ = conn.execute(
+            "UPDATE tasks SET status = 'failed', error = ?1 WHERE id = ?2",
+            params![format!("无法启动引擎：{error}"), task_id],
+        );
+        format!("无法启动 Python 引擎：{error}")
+    })?;
+    app.state::<TaskRegistry>()
+        .0
+        .lock()
+        .unwrap()
+        .insert(task_id.clone(), child);
+
+    drop(conn);
+    spawn_task_watcher(app.clone(), task_id.clone(), project_dir);
+
+    Ok(TaskInfo {
+        id: task_id,
+        project_id,
+        kind: "reconstruction".into(),
+        status: "running".into(),
+        stage: "data".into(),
+        progress: 0.01,
+        started_at: Some(now),
+        finished_at: None,
+        error: None,
+        latest: None,
+    })
+}
+
+#[tauri::command]
+fn pause_task(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
+    let project_id = task_project_id(&app, &task_id)?;
+    let project_dir = project_dir(&app, &project_id)?;
+    write_control(&project_dir, "pause")?;
+    app.state::<Db>()
+        .0
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'paused' WHERE id = ?1",
+            [&task_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_task(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
+    let project_id = task_project_id(&app, &task_id)?;
+    let project_dir = project_dir(&app, &project_id)?;
+    write_control(&project_dir, "resume")?;
+    app.state::<Db>()
+        .0
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?1",
+            [&task_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_task(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
+    let project_id = task_project_id(&app, &task_id)?;
+    let project_dir = project_dir(&app, &project_id)?;
+    write_control(&project_dir, "cancel")?;
+    let child = app
+        .state::<TaskRegistry>()
+        .0
+        .lock()
+        .unwrap()
+        .remove(&task_id);
+    if let Some(child) = child {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child.kill();
+        }
+    }
+    app.state::<Db>()
+        .0
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE tasks
+             SET status = 'cancelled', finished_at = ?1, error = '用户取消'
+             WHERE id = ?2",
+            params![now_millis(), task_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_metrics(db: State<'_, Db>, task_id: String) -> Result<Vec<Value>, String> {
+    let conn = db.0.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT step, psnr, ssim, lpips, loss, vram_mb, created_at
+             FROM metrics
+             WHERE task_id = ?1
+             ORDER BY step",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([&task_id], |row| {
+            Ok(json!({
+                "step": row.get::<_, i64>(0)?,
+                "psnr": row.get::<_, Option<f64>>(1)?,
+                "ssim": row.get::<_, Option<f64>>(2)?,
+                "lpips": row.get::<_, Option<f64>>(3)?,
+                "loss": row.get::<_, Option<f64>>(4)?,
+                "vramMB": row.get::<_, Option<i64>>(5)?,
+                "createdAt": row.get::<_, i64>(6)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut metrics = Vec::new();
+    for row in rows {
+        metrics.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(metrics)
+}
+
+#[tauri::command]
+fn get_scene(app: tauri::AppHandle, project_id: String) -> Result<Option<Value>, String> {
+    let scene_path = project_dir(&app, &project_id)?.join("scene.json");
+    if !scene_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&scene_path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&raw).map(Some).map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -363,6 +961,7 @@ pub fn run() {
                 .join("titan.db");
             let db = Db::open(&db_path)?;
             app.manage(db);
+            app.manage(TaskRegistry(Mutex::new(HashMap::new())));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -370,7 +969,14 @@ pub fn run() {
             create_project,
             list_projects,
             import_images,
-            list_images
+            list_images,
+            start_reconstruction,
+            pause_task,
+            resume_task,
+            cancel_task,
+            get_task,
+            get_metrics,
+            get_scene
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

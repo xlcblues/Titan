@@ -1,7 +1,13 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { createDemoScene, type SceneMode } from "../lib/demoScene";
+import {
+  createDemoScene,
+  createTitanScene,
+  type SceneBundle,
+  type SceneMode,
+  type TitanSceneData,
+} from "../lib/demoScene";
 
 export interface SceneStats {
   pointCount: number;
@@ -13,6 +19,7 @@ export interface SceneStats {
 interface SceneCanvasProps {
   mode: SceneMode;
   onStats: (stats: SceneStats) => void;
+  scene?: TitanSceneData | null;
 }
 
 function disposeMaterial(material: THREE.Material | THREE.Material[]) {
@@ -23,9 +30,9 @@ function disposeMaterial(material: THREE.Material | THREE.Material[]) {
   }
 }
 
-export function SceneCanvas({ mode, onStats }: SceneCanvasProps) {
+export function SceneCanvas({ mode, onStats, scene }: SceneCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const demoRef = useRef<ReturnType<typeof createDemoScene> | null>(null);
+  const demoRef = useRef<SceneBundle | null>(null);
   const modeRef = useRef(mode);
   const onStatsRef = useRef(onStats);
   const statsRef = useRef<SceneStats>({
@@ -54,9 +61,9 @@ export function SceneCanvas({ mode, onStats }: SceneCanvasProps) {
     renderer.setSize(container.clientWidth, container.clientHeight);
     container.appendChild(renderer.domElement);
 
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color("#0B1116");
-    scene.fog = new THREE.Fog("#0B1116", 9, 18);
+    const world = new THREE.Scene();
+    world.background = new THREE.Color("#0B1116");
+    world.fog = new THREE.Fog("#0B1116", 9, 18);
 
     const camera = new THREE.PerspectiveCamera(
       48,
@@ -74,21 +81,21 @@ export function SceneCanvas({ mode, onStats }: SceneCanvasProps) {
     controls.maxDistance = 14;
     controls.maxPolarAngle = Math.PI * 0.92;
 
-    scene.add(new THREE.AmbientLight("#E6F7F5", 0.9));
+    world.add(new THREE.AmbientLight("#E6F7F5", 0.9));
     const keyLight = new THREE.DirectionalLight("#FFFFFF", 2.6);
     keyLight.position.set(3, 6, 4);
-    scene.add(keyLight);
+    world.add(keyLight);
     const rimLight = new THREE.PointLight("#2ED3BE", 7, 16);
     rimLight.position.set(-4.5, 2, -3.5);
-    scene.add(rimLight);
+    world.add(rimLight);
 
-    const demo = createDemoScene();
-    demo.setMode(modeRef.current);
-    scene.add(demo.group);
-    demoRef.current = demo;
+    const bundle = scene ? createTitanScene(scene) : createDemoScene();
+    bundle.setMode(modeRef.current);
+    world.add(bundle.group);
+    demoRef.current = bundle;
     statsRef.current = {
-      pointCount: demo.pointCount,
-      cameraCount: demo.cameraCount,
+      pointCount: bundle.pointCount,
+      cameraCount: bundle.cameraCount,
       selected: null,
       fps: 0,
     };
@@ -103,9 +110,9 @@ export function SceneCanvas({ mode, onStats }: SceneCanvasProps) {
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects([demo.points, demo.mesh], true);
+      const hits = raycaster.intersectObjects([bundle.points, bundle.mesh], true);
       if (hits.length === 0) {
-        demo.selection.visible = false;
+        bundle.selection.visible = false;
         if (statsRef.current.selected !== null) {
           statsRef.current.selected = null;
           onStatsRef.current({ ...statsRef.current });
@@ -113,8 +120,8 @@ export function SceneCanvas({ mode, onStats }: SceneCanvasProps) {
         return;
       }
       const hit = hits[0];
-      demo.selection.position.copy(hit.point);
-      demo.selection.visible = true;
+      bundle.selection.position.copy(hit.point);
+      bundle.selection.visible = true;
       statsRef.current.selected = `${hit.point.x.toFixed(2)}, ${hit.point.y.toFixed(2)}, ${hit.point.z.toFixed(2)}`;
       onStatsRef.current({ ...statsRef.current });
     };
@@ -146,9 +153,9 @@ export function SceneCanvas({ mode, onStats }: SceneCanvasProps) {
         statsRef.current.fps === 0
           ? instantFps
           : statsRef.current.fps * 0.9 + instantFps * 0.1;
-      demo.update(elapsed);
+      bundle.update(elapsed);
       controls.update();
-      renderer.render(scene, camera);
+      renderer.render(world, camera);
       if (now - lastStatsAt >= 500) {
         lastStatsAt = now;
         onStatsRef.current({ ...statsRef.current });
@@ -162,7 +169,7 @@ export function SceneCanvas({ mode, onStats }: SceneCanvasProps) {
       controls.dispose();
       renderer.dispose();
       renderer.domElement.remove();
-      demo.group.traverse((object) => {
+      bundle.group.traverse((object) => {
         if (object instanceof THREE.Mesh) {
           object.geometry.dispose();
           disposeMaterial(object.material);
@@ -176,7 +183,7 @@ export function SceneCanvas({ mode, onStats }: SceneCanvasProps) {
       });
       demoRef.current = null;
     };
-  }, []);
+  }, [scene]);
 
   return <div className="scene-canvas" ref={containerRef} aria-hidden="true" />;
 }

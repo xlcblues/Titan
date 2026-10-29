@@ -2,7 +2,7 @@ import * as THREE from "three";
 
 export type SceneMode = "camera" | "points" | "mesh";
 
-export interface DemoScene {
+export interface SceneBundle {
   group: THREE.Group;
   points: THREE.Points;
   mesh: THREE.Group;
@@ -12,6 +12,28 @@ export interface DemoScene {
   cameraCount: number;
   setMode(mode: SceneMode): void;
   update(elapsed: number): void;
+}
+
+export interface TitanCamera {
+  id?: number;
+  position: number[];
+  forward: number[];
+  width?: number;
+  height?: number;
+}
+
+export interface TitanSceneData {
+  version?: string;
+  engine?: string;
+  taskId?: string;
+  projectDir?: string;
+  points: number[][];
+  cameras: TitanCamera[];
+  renders?: { name: string; path: string; view: string }[];
+  novelView?: string;
+  metrics?: Record<string, number | string>;
+  history?: Record<string, unknown>[];
+  config?: Record<string, unknown>;
 }
 
 const ACCENT = "#2ED3BE";
@@ -151,6 +173,98 @@ function buildCameraPath(frames: number): {
   return { path, curve, scanner };
 }
 
+function buildTitanPoints(entries: number[][]): THREE.Points {
+  const positions = new Float32Array(entries.length * 3);
+  const colors = new Float32Array(entries.length * 3);
+  const teal = new THREE.Color(ACCENT);
+  const gold = new THREE.Color(GOLD);
+  const tmp = new THREE.Color();
+
+  entries.forEach((entry, index) => {
+    positions[index * 3] = entry[0];
+    positions[index * 3 + 1] = entry[1];
+    positions[index * 3 + 2] = entry[2];
+    const r = entry[3];
+    const g = entry[4];
+    const b = entry[5];
+    if (r != null && g != null && b != null) {
+      colors[index * 3] = r / 255;
+      colors[index * 3 + 1] = g / 255;
+      colors[index * 3 + 2] = b / 255;
+    } else {
+      const radius = Math.hypot(entry[0], entry[1], entry[2]);
+      const t = THREE.MathUtils.clamp((radius - 1.65) / 1.15, 0, 1);
+      tmp.copy(teal).lerp(gold, t);
+      colors[index * 3] = tmp.r;
+      colors[index * 3 + 1] = tmp.g;
+      colors[index * 3 + 2] = tmp.b;
+    }
+  });
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  const material = new THREE.PointsMaterial({
+    size: 0.05,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.94,
+    sizeAttenuation: true,
+  });
+  return new THREE.Points(geometry, material);
+}
+
+function buildTitanCameraPath(cameras: TitanCamera[]): {
+  path: THREE.Group;
+  curve: THREE.CatmullRomCurve3;
+  scanner: THREE.Mesh;
+} {
+  const keyPoints = cameras
+    .slice()
+    .sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
+    .map(
+      (camera) =>
+        new THREE.Vector3(camera.position[0], camera.position[1], camera.position[2]),
+    );
+  const path = new THREE.Group();
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(keyPoints),
+    new THREE.LineBasicMaterial({
+      color: ACCENT,
+      transparent: true,
+      opacity: 0.82,
+    }),
+  );
+  path.add(line);
+
+  const markerMaterial = new THREE.MeshBasicMaterial({
+    color: "#9FE8DE",
+    transparent: true,
+    opacity: 0.85,
+  });
+  const markerGeometry = new THREE.BoxGeometry(0.12, 0.12, 0.2);
+  for (const point of keyPoints) {
+    const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+    marker.position.copy(point);
+    path.add(marker);
+  }
+
+  const scanner = new THREE.Mesh(
+    new THREE.SphereGeometry(0.11, 14, 14),
+    new THREE.MeshBasicMaterial({ color: GOLD }),
+  );
+  scanner.visible = false;
+  path.add(scanner);
+
+  const curvePoints =
+    keyPoints.length >= 2
+      ? keyPoints
+      : [new THREE.Vector3(0, 0, 0), new THREE.Vector3(1, 0, 0)];
+  const closed = keyPoints.length > 2;
+  const curve = new THREE.CatmullRomCurve3(curvePoints, closed, "centripetal", 0.5);
+  return { path, curve, scanner };
+}
+
 function buildGround(): THREE.Group {
   const group = new THREE.Group();
   const grid = new THREE.GridHelper(16, 18, ACCENT, "#5F6C73");
@@ -178,7 +292,7 @@ function buildGround(): THREE.Group {
   return group;
 }
 
-export function createDemoScene(): DemoScene {
+export function createDemoScene(): SceneBundle {
   const group = new THREE.Group();
   const points = buildPointCloud(48_000);
   const mesh = buildMesh();
@@ -196,7 +310,7 @@ export function createDemoScene(): DemoScene {
 
   group.add(points, mesh, cameraPath, ground, selection);
 
-  const demo: DemoScene = {
+  const demo: SceneBundle = {
     group,
     points,
     mesh,
@@ -224,4 +338,52 @@ export function createDemoScene(): DemoScene {
 
   demo.setMode("points");
   return demo;
+}
+
+export function createTitanScene(data: TitanSceneData): SceneBundle {
+  const group = new THREE.Group();
+  const points = buildTitanPoints(data.points);
+  const mesh = new THREE.Group();
+  const { path: cameraPath, curve, scanner } = buildTitanCameraPath(data.cameras);
+  const ground = buildGround();
+  const selection = new THREE.Mesh(
+    new THREE.SphereGeometry(0.17, 18, 18),
+    new THREE.MeshBasicMaterial({
+      color: "#FFD37A",
+      transparent: true,
+      opacity: 0.95,
+    }),
+  );
+  selection.visible = false;
+
+  group.add(points, mesh, cameraPath, ground, selection);
+
+  const scene: SceneBundle = {
+    group,
+    points,
+    mesh,
+    cameraPath,
+    selection,
+    pointCount: data.points.length,
+    cameraCount: data.cameras.length,
+    setMode(mode) {
+      points.visible = mode === "points";
+      mesh.visible = mode === "mesh";
+      cameraPath.visible = mode === "camera";
+      scanner.visible = mode === "camera";
+      selection.visible = false;
+    },
+    update(elapsed) {
+      if (cameraPath.visible && data.cameras.length > 1) {
+        scanner.position.copy(curve.getPointAt((elapsed * 0.05) % 1));
+      }
+      if (selection.visible) {
+        const pulse = 1 + 0.14 * Math.sin(elapsed * 5);
+        selection.scale.set(pulse, pulse, pulse);
+      }
+    },
+  };
+
+  scene.setMode("points");
+  return scene;
 }

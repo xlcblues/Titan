@@ -2,9 +2,15 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   ArrowLeft,
+  Cpu,
+  Eye,
   FolderOpen,
   ImagePlus,
   LoaderCircle,
+  Pause,
+  Play,
+  RotateCcw,
+  Square,
   Upload,
 } from "lucide-react";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -13,6 +19,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { StatusPill } from "../components/StatusPill";
 import { useProjectImages, useProjects } from "../hooks/useProjects";
+import { useTasks } from "../hooks/useTasks";
 import { projectStatusMeta } from "../utils/projectMeta";
 
 function formatBytes(size: number | null) {
@@ -21,17 +28,95 @@ function formatBytes(size: number | null) {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function taskStatusMeta(status: string | undefined) {
+  switch (status) {
+    case "running":
+      return { label: "训练中", tone: "accent" as const };
+    case "paused":
+      return { label: "已暂停", tone: "warning" as const };
+    case "done":
+      return { label: "已完成", tone: "success" as const };
+    case "failed":
+      return { label: "失败", tone: "danger" as const };
+    case "cancelled":
+      return { label: "已取消", tone: "neutral" as const };
+    default:
+      return { label: "未开始", tone: "neutral" as const };
+  }
+}
+
+function stageLabel(stage: string | undefined) {
+  const labels: Record<string, string> = {
+    data: "数据准备",
+    training: "TFRF 训练",
+    render: "渲染导出",
+    done: "完成",
+    error: "错误",
+    cancel: "已取消",
+  };
+  return stage ? (labels[stage] ?? stage) : "等待开始";
+}
+
+function formatMetric(value: number | undefined, digits: number, suffix = "") {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value.toFixed(digits)}${suffix}`
+    : "—";
+}
+
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const projectId = id ?? "";
   const { projects, refresh: refreshProjects } = useProjects();
   const { images, loading, error, importImages } = useProjectImages(projectId);
+  const {
+    task,
+    loading: taskLoading,
+    error: taskError,
+    start,
+    pause,
+    resume,
+    cancel,
+  } = useTasks(projectId);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   const project = projects.find((item) => item.id === projectId);
   const status = projectStatusMeta(project?.status ?? "idle");
+  const taskMeta = taskStatusMeta(task?.status);
+
+  const startTask = useCallback(async () => {
+    try {
+      await start();
+      setNotice("重建任务已启动");
+    } catch (err) {
+      setNotice(`启动失败：${err}`);
+    }
+  }, [start]);
+
+  const runPause = useCallback(async () => {
+    try {
+      await pause();
+    } catch (err) {
+      setNotice(`暂停失败：${err}`);
+    }
+  }, [pause]);
+
+  const runResume = useCallback(async () => {
+    try {
+      await resume();
+    } catch (err) {
+      setNotice(`恢复失败：${err}`);
+    }
+  }, [resume]);
+
+  const runCancel = useCallback(async () => {
+    try {
+      await cancel();
+    } catch (err) {
+      setNotice(`取消失败：${err}`);
+    }
+  }, [cancel]);
 
   const runImport = useCallback(
     async (paths: string[]) => {
@@ -77,6 +162,10 @@ export function ProjectDetail() {
       unlisten?.();
     };
   }, [runImport]);
+
+  useEffect(() => {
+    if (task?.status === "done") void refreshProjects();
+  }, [task?.status, refreshProjects]);
 
   const pickImages = async () => {
     try {
@@ -149,6 +238,135 @@ export function ProjectDetail() {
       </section>
 
       {notice && <div className="import-notice">{notice}</div>}
+
+      <section className="panel task-panel">
+        <div className="panel__header">
+          <h2 className="panel__title">重建任务</h2>
+          <StatusPill
+            tone={taskMeta.tone}
+            label={taskLoading ? "读取中" : taskMeta.label}
+          />
+        </div>
+        <div className="panel__body task-panel__body">
+          <div className="task-runner">
+            <div className="task-runner__actions">
+              <button
+                className="btn btn--primary"
+                type="button"
+                onClick={() => void startTask()}
+                disabled={
+                  images.length === 0 ||
+                  task?.status === "running" ||
+                  task?.status === "paused"
+                }
+              >
+                <Cpu size={16} />
+                开始重建
+              </button>
+              {task?.status === "running" && (
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={() => void runPause()}
+                >
+                  <Pause size={16} />
+                  暂停
+                </button>
+              )}
+              {task?.status === "paused" && (
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={() => void runResume()}
+                >
+                  <Play size={16} />
+                  继续
+                </button>
+              )}
+              {(task?.status === "running" || task?.status === "paused") && (
+                <button
+                  className="btn btn--ghost"
+                  type="button"
+                  onClick={() => void runCancel()}
+                >
+                  <Square size={16} />
+                  取消
+                </button>
+              )}
+              {task?.status === "failed" && (
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={() => void startTask()}
+                >
+                  <RotateCcw size={16} />
+                  重试
+                </button>
+              )}
+              {task?.status === "done" && (
+                <Link
+                  className="btn btn--secondary"
+                  to={`/scene?project=${projectId}`}
+                >
+                  <Eye size={16} />
+                  查看场景
+                </Link>
+              )}
+            </div>
+            <div className="task-runner__progress">
+              <div className="task-stage">
+                <span className="task-stage__label">
+                  {stageLabel(task?.stage)}
+                </span>
+                <span className="task-stage__value mono">
+                  {task ? `${Math.round(task.progress * 100)}%` : "—"}
+                </span>
+              </div>
+              <div
+                className="task-progress"
+                role="progressbar"
+                aria-valuenow={Math.round((task?.progress ?? 0) * 100)}
+                aria-valuemin={0}
+                aria-valuemax={100}
+              >
+                <div className="progress">
+                  <div
+                    className="progress__bar"
+                    style={{ width: `${(task?.progress ?? 0) * 100}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="task-metrics">
+            <div className="metric-row">
+              <span className="metric-row__label">Loss</span>
+              <span className="metric-row__value mono">
+                {formatMetric(task?.latest?.loss, 4)}
+              </span>
+            </div>
+            <div className="metric-row">
+              <span className="metric-row__label">PSNR</span>
+              <span className="metric-row__value mono">
+                {formatMetric(task?.latest?.psnr, 2, " dB")}
+              </span>
+            </div>
+            <div className="metric-row">
+              <span className="metric-row__label">SSIM</span>
+              <span className="metric-row__value mono">
+                {formatMetric(task?.latest?.ssim, 3)}
+              </span>
+            </div>
+            <div className="metric-row">
+              <span className="metric-row__label">显存</span>
+              <span className="metric-row__value mono">
+                {formatMetric(task?.latest?.vramMB, 0, " MB")}
+              </span>
+            </div>
+          </div>
+          {taskError && <div className="task-error">{taskError}</div>}
+        </div>
+      </section>
 
       <section className="panel thumb-panel">
         <div className="panel__header">

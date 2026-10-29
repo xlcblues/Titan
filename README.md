@@ -16,8 +16,9 @@ Titan 是面向 Windows 桌面端的三维重建软件，采用自研的 Facet R
 | --- | --- | --- |
 | M0 | Logo、主题令牌、设计规范、预览页 | 已完成 |
 | M1 | Tauri 桌面骨架、侧边栏/顶栏、主题切换、路由 | 已完成 |
-| M2 | 项目创建、图片拖拽导入、缩略图、SQLite 持久化 | 待开始 |
-| M3 | 重建管线与渲染场景接入 | 待开始 |
+| M2 | 项目创建、图片拖拽导入、缩略图、SQLite 持久化 | 已完成 |
+| M3 | 重建管线与渲染场景接入 | 已完成 |
+| M4 | 任务引擎、指标回传、渲染导出与真实场景预览 | 已完成 |
 
 ## 本地开发
 
@@ -40,6 +41,7 @@ cargo check
 ```text
 src/          前端 React 应用
 src-tauri/    Rust / Tauri 后端
+python/       Python 重建引擎（TFRF）
 design/       Logo、UI 规范与设计预览
 docs/         技术选型、开发流程与算法方案
 assets/logo/  Logo 源文件

@@ -4,11 +4,13 @@ import {
   FolderKanban,
   Plus,
   Search,
+  Trash2,
 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { CreateProjectDialog } from "../components/CreateProjectDialog";
+import { DeleteProjectDialog } from "../components/DeleteProjectDialog";
 import { StatusPill } from "../components/StatusPill";
-import { useProjects } from "../hooks/useProjects";
+import { useProjects, type Project } from "../hooks/useProjects";
 import { formatUpdated, projectStatusMeta } from "../utils/projectMeta";
 
 type Filter = "all" | "active" | "done";
@@ -20,10 +22,11 @@ const FILTERS: { value: Filter; label: string }[] = [
 ];
 
 export function Projects() {
-  const { projects, loading, error, createProject } = useProjects();
+  const { projects, loading, error, createProject, deleteProject } = useProjects();
   const [filter, setFilter] = useState<Filter>("all");
   const [query, setQuery] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
 
   const visible = useMemo(() => {
     const keyword = query.trim().toLowerCase();
@@ -134,6 +137,15 @@ export function Projects() {
                         >
                           <Eye size={16} />
                         </Link>
+                        <button
+                          className="icon-btn icon-btn--danger"
+                          type="button"
+                          onClick={() => setDeleteTarget(project)}
+                          title="删除项目"
+                          aria-label={`删除 ${project.name}`}
+                        >
+                          <Trash2 size={16} />
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -149,6 +161,13 @@ export function Projects() {
         onClose={() => setDialogOpen(false)}
         onSubmit={(name) => createProject(name)}
       />
+      {deleteTarget && (
+        <DeleteProjectDialog
+          projectName={deleteTarget.name}
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={() => deleteProject(deleteTarget.id)}
+        />
+      )}
     </>
   );
 }

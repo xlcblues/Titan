@@ -95,7 +95,16 @@ export function useProjects() {
     [],
   );
 
-  return { projects, loading, error, refresh, createProject };
+  const deleteProject = useCallback(async (projectId: string) => {
+    if (!isTauri()) {
+      setProjects((prev) => prev.filter((item) => item.id !== projectId));
+      return;
+    }
+    await invoke("delete_project", { projectId });
+    setProjects((prev) => prev.filter((item) => item.id !== projectId));
+  }, []);
+
+  return { projects, loading, error, refresh, createProject, deleteProject };
 }
 
 export function useProjectImages(projectId: string) {

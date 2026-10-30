@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   ArrowLeft,
   Cpu,
@@ -11,12 +11,14 @@ import {
   Play,
   RotateCcw,
   Square,
+  Trash2,
   Upload,
 } from "lucide-react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { DeleteProjectDialog } from "../components/DeleteProjectDialog";
 import { StatusPill } from "../components/StatusPill";
 import { useProjectImages, useProjects } from "../hooks/useProjects";
 import { useTasks } from "../hooks/useTasks";
@@ -67,7 +69,8 @@ function formatMetric(value: number | undefined, digits: number, suffix = "") {
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const projectId = id ?? "";
-  const { projects, refresh: refreshProjects } = useProjects();
+  const navigate = useNavigate();
+  const { projects, refresh: refreshProjects, deleteProject } = useProjects();
   const { images, loading, error, importImages } = useProjectImages(projectId);
   const {
     task,
@@ -81,6 +84,7 @@ export function ProjectDetail() {
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
   const project = projects.find((item) => item.id === projectId);
   const status = projectStatusMeta(project?.status ?? "idle");
@@ -208,6 +212,17 @@ export function ProjectDetail() {
         </div>
         <div className="page-header__actions">
           <StatusPill tone={status.tone} label={status.label} />
+          {project && (
+            <button
+              className="btn btn--danger-ghost"
+              type="button"
+              onClick={() => setDeleteOpen(true)}
+              title="删除项目"
+            >
+              <Trash2 size={16} />
+              删除项目
+            </button>
+          )}
         </div>
       </div>
 
@@ -425,6 +440,16 @@ export function ProjectDetail() {
           )}
         </div>
       </section>
+      {deleteOpen && project && (
+        <DeleteProjectDialog
+          projectName={project.name}
+          onClose={() => setDeleteOpen(false)}
+          onConfirm={async () => {
+            await deleteProject(project.id);
+            navigate("/projects");
+          }}
+        />
+      )}
     </>
   );
 }

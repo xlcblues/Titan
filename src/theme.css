@@ -154,6 +154,24 @@ a {
   color: var(--text);
 }
 
+.btn--danger {
+  background: var(--danger);
+  color: var(--bg);
+}
+
+.btn--danger:hover {
+  filter: brightness(0.96);
+}
+
+.btn--danger-ghost {
+  background: transparent;
+  color: var(--danger);
+}
+
+.btn--danger-ghost:hover {
+  background: rgba(190, 65, 62, 0.1);
+}
+
 .btn[disabled] {
   opacity: 0.45;
   cursor: not-allowed;
@@ -179,6 +197,11 @@ a {
 .icon-btn:hover {
   background: var(--accent-soft);
   color: var(--text);
+}
+
+.icon-btn--danger:hover {
+  background: rgba(190, 65, 62, 0.1);
+  color: var(--danger);
 }
 
 .card {

@@ -1279,6 +1279,12 @@
   padding: 16px;
 }
 
+.modal-copy {
+  margin: 0;
+  color: var(--text-secondary);
+  line-height: 22px;
+}
+
 .field-label {
   font-size: 12px;
   line-height: 18px;

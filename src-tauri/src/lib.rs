@@ -69,6 +69,22 @@ struct TaskInfo {
 
 struct TaskRegistry(Mutex<HashMap<String, Child>>);
 
+fn kill_child(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill();
+    }
+}
+
 struct Db(Mutex<Connection>);
 
 impl Db {
@@ -311,6 +327,62 @@ fn list_projects(db: State<'_, Db>) -> Result<Vec<Project>, String> {
         projects.push(row.map_err(|error| error.to_string())?);
     }
     Ok(projects)
+}
+
+#[tauri::command]
+fn delete_project(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
+    let task_ids: Vec<String> = {
+        let db = app.state::<Db>();
+        let conn = db.0.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM tasks WHERE project_id = ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([&project_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(|error| error.to_string())?);
+        }
+        ids
+    };
+
+    {
+        let registry = app.state::<TaskRegistry>();
+        let mut guard = registry.0.lock().unwrap();
+        for task_id in &task_ids {
+            if let Some(mut child) = guard.remove(task_id) {
+                kill_child(&mut child);
+            }
+        }
+    }
+
+    let affected = app
+        .state::<Db>()
+        .0
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM projects WHERE id = ?1", [&project_id])
+        .map_err(|error| error.to_string())?;
+    if affected == 0 {
+        return Err("项目不存在".into());
+    }
+
+    let project_dir = project_dir(&app, &project_id)?;
+    if project_dir.exists() {
+        let mut attempts = 0;
+        loop {
+            match fs::remove_dir_all(&project_dir) {
+                Ok(()) => break,
+                Err(_) if attempts < 3 => {
+                    attempts += 1;
+                    thread::sleep(std::time::Duration::from_millis(120 * attempts));
+                }
+                Err(error) => return Err(format!("删除项目目录失败：{error}")),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -934,20 +1006,8 @@ fn cancel_task(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
         .lock()
         .unwrap()
         .remove(&task_id);
-    if let Some(child) = child {
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = child.kill();
-        }
+    if let Some(mut child) = child {
+        kill_child(&mut child);
     }
     app.state::<Db>()
         .0
@@ -1024,6 +1084,7 @@ pub fn run() {
             app_info,
             create_project,
             list_projects,
+            delete_project,
             import_images,
             list_images,
             start_reconstruction,

@@ -46,6 +46,13 @@ export const SceneCanvas = forwardRef<
   const containerRef = useRef<HTMLDivElement | null>(null);
   const demoRef = useRef<SceneBundle | null>(null);
   const resetViewRef = useRef<() => void>(() => {});
+  const fitViewRef = useRef<() => void>(() => {});
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const controlsRef = useRef<OrbitControls | null>(null);
+  const homePositionsRef = useRef<{
+    position: THREE.Vector3;
+    target: THREE.Vector3;
+  } | null>(null);
   const modeRef = useRef(mode);
   const onStatsRef = useRef(onStats);
   const statsRef = useRef<SceneStats>({
@@ -69,6 +76,7 @@ export const SceneCanvas = forwardRef<
 
   useEffect(() => {
     demoRef.current?.setMode(mode);
+    fitViewRef.current();
   }, [mode]);
 
   useEffect(() => {
@@ -92,11 +100,13 @@ export const SceneCanvas = forwardRef<
       0.01,
       120,
     );
+    cameraRef.current = camera;
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
     controls.maxPolarAngle = Math.PI * 0.92;
+    controlsRef.current = controls;
 
     world.add(new THREE.AmbientLight("#E6F7F5", 0.9));
     const keyLight = new THREE.DirectionalLight("#FFFFFF", 2.6);
@@ -110,31 +120,64 @@ export const SceneCanvas = forwardRef<
     bundle.setMode(modeRef.current);
     world.add(bundle.group);
     demoRef.current = bundle;
-    const center = bundle.sceneCenter;
     const radius = Math.max(bundle.sceneRadius, 1e-3);
-    const fitDistance = Math.max(radius * 2.4, 1.2);
-    const offset = new THREE.Vector3(0.68, 0.42, 0.68)
-      .normalize()
-      .multiplyScalar(fitDistance);
-    camera.near = Math.max(radius * 0.002, 0.01);
-    camera.far = Math.max(radius * 60, 20);
-    camera.position.copy(center).add(offset);
-    camera.updateProjectionMatrix();
-    controls.target.copy(center);
-    controls.minDistance = Math.max(radius * 0.04, 0.05);
-    controls.maxDistance = Math.max(radius * 12, 12);
-    world.fog = new THREE.Fog(
-      "#0B1116",
-      radius * 4,
-      radius * 9,
-    );
-    const homePosition = camera.position.clone();
-    const homeTarget = controls.target.clone();
-    resetViewRef.current = () => {
-      camera.position.copy(homePosition);
-      controls.target.copy(homeTarget);
+    const fitBundle = (bundleToFit: SceneBundle, fitMode: SceneMode) => {
+      const focusCenter =
+        fitMode === "camera"
+          ? bundleToFit.cameraCenter
+          : bundleToFit.pointCenter;
+      const focusRadius = Math.max(
+        fitMode === "camera"
+          ? bundleToFit.cameraRadius
+          : bundleToFit.pointRadius,
+        1e-3,
+      );
+      const fitDistance = Math.max(focusRadius * 2.2, 1.2);
+      const offsetDirection = new THREE.Vector3(0.68, 0.42, 0.68).normalize();
+      if (fitMode === "camera" && bundleToFit.viewDirection.lengthSq() > 1e-6) {
+        offsetDirection
+          .copy(bundleToFit.viewDirection)
+          .multiplyScalar(-1)
+          .add(new THREE.Vector3(0, 0.2, 0))
+          .normalize();
+      }
+      const offset = offsetDirection.multiplyScalar(fitDistance);
+      camera.near = Math.max(radius * 0.002, 0.01);
+      camera.far = Math.max(radius * 60, 20);
+      camera.position.copy(focusCenter).add(offset);
+      camera.updateProjectionMatrix();
+      controls.target.copy(focusCenter);
+      controls.minDistance = Math.max(focusRadius * 0.08, 0.05);
+      controls.maxDistance = Math.max(radius * 12, 12);
       controls.update();
     };
+    fitBundle(bundle, modeRef.current);
+    homePositionsRef.current = {
+      position: camera.position.clone(),
+      target: controls.target.clone(),
+    };
+    fitViewRef.current = () => {
+      const currentBundle = demoRef.current;
+      const currentCamera = cameraRef.current;
+      const currentControls = controlsRef.current;
+      if (!currentBundle || !currentCamera || !currentControls) return;
+      fitBundle(currentBundle, modeRef.current);
+      homePositionsRef.current = {
+        position: currentCamera.position.clone(),
+        target: currentControls.target.clone(),
+      };
+      currentControls.update();
+    };
+    resetViewRef.current = () => {
+      const home = homePositionsRef.current;
+      const currentCamera = cameraRef.current;
+      const currentControls = controlsRef.current;
+      if (!home || !currentCamera || !currentControls) return;
+      currentCamera.position.copy(home.position);
+      currentControls.target.copy(home.target);
+      currentControls.update();
+    };
+    world.fog = new THREE.Fog("#0B1116", radius * 4, radius * 9);
     bundle.setViewCamera(camera);
     statsRef.current = {
       pointCount: bundle.pointCount,
@@ -227,6 +270,11 @@ export const SceneCanvas = forwardRef<
         }
       });
       demoRef.current = null;
+      cameraRef.current = null;
+      controlsRef.current = null;
+      homePositionsRef.current = null;
+      resetViewRef.current = () => {};
+      fitViewRef.current = () => {};
     };
   }, [scene]);
 

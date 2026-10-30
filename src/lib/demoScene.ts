@@ -13,6 +13,11 @@ export interface SceneBundle {
   cameraCount: number;
   sceneCenter: THREE.Vector3;
   sceneRadius: number;
+  pointCenter: THREE.Vector3;
+  pointRadius: number;
+  cameraCenter: THREE.Vector3;
+  cameraRadius: number;
+  viewDirection: THREE.Vector3;
   setMode(mode: SceneMode): void;
   setViewCamera(camera: THREE.PerspectiveCamera): void;
   update(elapsed: number): void;
@@ -20,6 +25,7 @@ export interface SceneBundle {
 
 export interface TitanCamera {
   id?: number;
+  path?: string;
   position: number[];
   forward: number[];
   width?: number;
@@ -345,19 +351,34 @@ function buildTitanPoints(entries: number[][], radius: number): THREE.Points {
 
 function buildTitanCameraPath(
   cameras: TitanCamera[],
-  radius: number,
+  cameraRadius: number,
 ): {
   path: THREE.Group;
   curve: THREE.CatmullRomCurve3;
   scanner: THREE.Mesh;
   markers: THREE.Sprite[];
 } {
+  const orderOf = (
+    camera: TitanCamera,
+    index: number,
+  ): { order: number; label: string } => {
+    const basename = (camera.path ?? "").split(/[\\/]/).pop() ?? "";
+    const digits = basename.match(/(\d+)/);
+    if (digits) {
+      return { order: Number(digits[0]), label: digits[0] };
+    }
+    return { order: camera.id ?? index, label: String(camera.id ?? index) };
+  };
   const sortedCameras = cameras
-    .slice()
-    .sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+    .map((camera, index) => ({ camera, ...orderOf(camera, index) }))
+    .sort((a, b) => a.order - b.order);
   const keyPoints = sortedCameras.map(
-    (camera) =>
-      new THREE.Vector3(camera.position[0], camera.position[1], camera.position[2]),
+    ({ camera }) =>
+      new THREE.Vector3(
+        camera.position[0],
+        camera.position[1],
+        camera.position[2],
+      ),
   );
   const path = new THREE.Group();
   const line = new THREE.Line(
@@ -371,7 +392,7 @@ function buildTitanCameraPath(
   path.add(line);
 
   const circleTexture = makeCircleTexture();
-  const markerSize = Math.max(radius * 0.07, 0.2);
+  const markerSize = Math.max(cameraRadius * 0.3, 0.12);
   const coneGeometry = new THREE.ConeGeometry(
     markerSize * 0.6,
     markerSize * 1.6,
@@ -400,14 +421,14 @@ function buildTitanCameraPath(
     opacity: 0.95,
     depthTest: false,
     depthWrite: false,
-    sizeAttenuation: false,
+    sizeAttenuation: true,
   });
   const markers: THREE.Sprite[] = [];
   const up = new THREE.Vector3(0, 1, 0);
   const orientation = new THREE.Quaternion();
   const showLabels = cameras.length <= 80;
   for (const [index, point] of keyPoints.entries()) {
-    const camera = sortedCameras[index];
+    const { camera, label: labelText } = sortedCameras[index];
     const cone = new THREE.Mesh(coneGeometry, coneMaterial);
     cone.position.copy(point);
     const frustum = new THREE.Mesh(frustumGeometry, frustumMaterial);
@@ -424,22 +445,22 @@ function buildTitanCameraPath(
     path.add(frustum);
     const marker = new THREE.Sprite(markerSpriteMaterial);
     marker.position.copy(point);
-    marker.scale.set(24, 24, 1);
+    marker.scale.set(markerSize * 0.8, markerSize * 0.8, 1);
     markers.push(marker);
     path.add(marker);
 
     if (showLabels) {
       const label = new THREE.Sprite(
         new THREE.SpriteMaterial({
-          map: makeLabelTexture(String(camera.id ?? index + 1)),
+          map: makeLabelTexture(labelText),
           transparent: true,
           depthTest: false,
           depthWrite: false,
-          sizeAttenuation: false,
+          sizeAttenuation: true,
         }),
       );
-      label.position.copy(point).addScaledVector(up, markerSize * 1.7);
-      label.scale.set(64, 24, 1);
+      label.position.copy(point).addScaledVector(up, markerSize * 2.0);
+      label.scale.set(markerSize * 1.5, markerSize * 0.56, 1);
       markers.push(label);
       path.add(label);
     }
@@ -462,7 +483,7 @@ function buildTitanCameraPath(
     new THREE.TubeGeometry(
       curve,
       Math.max(96, keyPoints.length * 12),
-      Math.max(radius * 0.006, 0.015),
+      Math.max(cameraRadius * 0.03, 0.008),
       8,
       closed,
     ),
@@ -548,11 +569,19 @@ export function createDemoScene(): SceneBundle {
     cameraCount: 24,
     sceneCenter,
     sceneRadius,
+    pointCenter: sceneCenter.clone(),
+    pointRadius: sceneRadius,
+    cameraCenter: sceneCenter.clone(),
+    cameraRadius: 4,
+    viewDirection: new THREE.Vector3(0, 0, 1),
     setMode(mode) {
-      points.visible = mode === "points";
+      const pointMaterial = points.material as THREE.PointsMaterial;
+      const isCameraMode = mode === "camera";
+      points.visible = mode === "points" || isCameraMode;
+      pointMaterial.opacity = isCameraMode ? 0.3 : 0.96;
       mesh.visible = mode === "mesh";
-      cameraPath.visible = mode === "camera";
-      scanner.visible = mode === "camera";
+      cameraPath.visible = isCameraMode;
+      scanner.visible = isCameraMode;
       selection.visible = false;
     },
     setViewCamera(camera) {
@@ -577,48 +606,109 @@ export function createDemoScene(): SceneBundle {
   return demo;
 }
 
+function normalizeViewerY(scene: TitanSceneData): TitanSceneData {
+  const flipY = scene.poseSource === "colmap" || scene.poseSource === "llff";
+  if (!flipY) return scene;
+  const flip = (values: number[]) => [values[0], -values[1], values[2]];
+  return {
+    ...scene,
+    points: scene.points.map((point) => [
+      point[0],
+      -point[1],
+      point[2],
+      point[3],
+      point[4],
+      point[5],
+    ]),
+    cameras: scene.cameras.map((camera) => ({
+      ...camera,
+      position: flip(camera.position),
+      forward: flip(camera.forward),
+    })),
+  };
+}
+
 export function createTitanScene(data: TitanSceneData): SceneBundle {
   const group = new THREE.Group();
-  const sceneCenter = new THREE.Vector3();
-  let sceneRadius = 1;
-  let pointRadius = 1;
-  if (data.points.length > 0) {
-    const box = new THREE.Box3();
-    data.points.forEach((point) => {
-      box.expandByPoint(new THREE.Vector3(point[0], point[1], point[2]));
-    });
-    box.getCenter(sceneCenter);
-    const size = box.getSize(new THREE.Vector3());
-    pointRadius = Math.max(size.x, size.y, size.z) / 2;
-    sceneRadius = pointRadius;
-  }
-  if (data.cameras.length > 0) {
-    const cameraBox = new THREE.Box3();
-    data.cameras.forEach((camera) => {
-      cameraBox.expandByPoint(
-        new THREE.Vector3(
-          camera.position[0],
-          camera.position[1],
-          camera.position[2],
-        ),
+  const viewerData = normalizeViewerY(data);
+  const pointEntries = viewerData.points;
+  const cameraEntries = viewerData.cameras;
+  const pointBox = new THREE.Box3();
+  const cameraBox = new THREE.Box3();
+  pointEntries.forEach((point) => {
+    pointBox.expandByPoint(new THREE.Vector3(point[0], point[1], point[2]));
+  });
+  cameraEntries.forEach((camera) => {
+    cameraBox.expandByPoint(
+      new THREE.Vector3(
+        camera.position[0],
+        camera.position[1],
+        camera.position[2],
+      ),
+    );
+  });
+
+  const combinedBox = new THREE.Box3();
+  if (!pointBox.isEmpty()) combinedBox.union(pointBox);
+  if (!cameraBox.isEmpty()) combinedBox.union(cameraBox);
+  const combinedCenter = combinedBox.getCenter(new THREE.Vector3());
+  const combinedSize = combinedBox.getSize(new THREE.Vector3());
+  const sceneRadius = Math.max(
+    Math.max(combinedSize.x, combinedSize.y, combinedSize.z) / 2,
+    1e-3,
+  );
+
+  const pointCenter = pointBox.isEmpty()
+    ? new THREE.Vector3()
+    : pointBox
+        .getCenter(new THREE.Vector3())
+        .sub(combinedCenter);
+  const pointSize = pointBox.getSize(new THREE.Vector3());
+  const pointRadius = pointBox.isEmpty()
+    ? 1
+    : Math.max(
+        Math.max(pointSize.x, pointSize.y, pointSize.z) / 2,
+        1e-3,
       );
+  const cameraCenter = cameraBox.isEmpty()
+    ? new THREE.Vector3()
+    : cameraBox
+        .getCenter(new THREE.Vector3())
+        .sub(combinedCenter);
+  const cameraSize = cameraBox.getSize(new THREE.Vector3());
+  const cameraRadius = cameraBox.isEmpty()
+    ? 1
+    : Math.max(
+        Math.max(cameraSize.x, cameraSize.y, cameraSize.z) / 2,
+        1e-3,
+      );
+  const viewDirection = new THREE.Vector3();
+  if (!pointBox.isEmpty() && !cameraBox.isEmpty()) {
+    const pointMean = new THREE.Vector3();
+    pointEntries.forEach((point) => {
+      pointMean.x += point[0];
+      pointMean.y += point[1];
+      pointMean.z += point[2];
     });
-    const center = cameraBox.getCenter(new THREE.Vector3());
-    const size = cameraBox.getSize(new THREE.Vector3());
-    sceneCenter.addVectors(sceneCenter, center).multiplyScalar(0.5);
-    sceneRadius = Math.max(sceneRadius, Math.max(size.x, size.y, size.z) / 2);
+    pointMean.divideScalar(pointEntries.length).sub(combinedCenter);
+    viewDirection.copy(pointMean).sub(cameraCenter);
   }
-  if (sceneRadius < 1e-3) sceneRadius = 1;
-  const points = buildTitanPoints(data.points, Math.max(pointRadius, 1e-3));
+  if (viewDirection.lengthSq() < 1e-6) {
+    viewDirection.set(0, 0, 1);
+  } else {
+    viewDirection.normalize();
+  }
+
+  const points = buildTitanPoints(pointEntries, Math.max(pointRadius, 1e-3));
   const mesh = new THREE.Group();
   const {
     path: cameraPath,
     curve,
     scanner,
     markers,
-  } = buildTitanCameraPath(data.cameras, sceneRadius);
+  } = buildTitanCameraPath(cameraEntries, cameraRadius);
   const ground = buildGround(sceneRadius);
-  ground.position.y = sceneCenter.y - sceneRadius;
+  ground.position.y = combinedCenter.y - sceneRadius;
   const selection = new THREE.Mesh(
     new THREE.SphereGeometry(0.17, 18, 18),
     new THREE.MeshBasicMaterial({
@@ -630,7 +720,7 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
   selection.visible = false;
 
   group.add(points, mesh, cameraPath, ground, selection);
-  group.position.copy(sceneCenter).multiplyScalar(-1);
+  group.position.copy(combinedCenter).multiplyScalar(-1);
 
   let viewCamera: THREE.PerspectiveCamera | null = null;
   const scene: SceneBundle = {
@@ -640,22 +730,30 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
     cameraPath,
     markers,
     selection,
-    pointCount: data.points.length,
-    cameraCount: data.cameras.length,
+    pointCount: pointEntries.length,
+    cameraCount: cameraEntries.length,
     sceneCenter: new THREE.Vector3(),
     sceneRadius,
+    pointCenter,
+    pointRadius,
+    cameraCenter,
+    cameraRadius,
+    viewDirection,
     setMode(mode) {
-      points.visible = mode === "points";
+      const pointMaterial = points.material as THREE.PointsMaterial;
+      const isCameraMode = mode === "camera";
+      points.visible = mode === "points" || isCameraMode;
+      pointMaterial.opacity = isCameraMode ? 0.3 : 0.96;
       mesh.visible = mode === "mesh";
-      cameraPath.visible = mode === "camera";
-      scanner.visible = mode === "camera";
+      cameraPath.visible = isCameraMode;
+      scanner.visible = isCameraMode;
       selection.visible = false;
     },
     setViewCamera(camera) {
       viewCamera = camera;
     },
     update(elapsed) {
-      if (cameraPath.visible && data.cameras.length > 1) {
+      if (cameraPath.visible && cameraEntries.length > 1) {
         scanner.position.copy(curve.getPointAt((elapsed * 0.05) % 1));
       }
       const currentViewCamera = viewCamera;

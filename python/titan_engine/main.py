@@ -38,6 +38,27 @@ def emit_status(project_dir: Path, payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def emit_training_status(
+    project_dir: Path,
+    task_id: str,
+    step: int,
+    steps: int,
+    loss: float,
+) -> None:
+    emit_status(
+        project_dir,
+        {
+            "taskId": task_id,
+            "status": "running",
+            "stage": "training",
+            "progress": round((step + 1) / steps, 4),
+            "step": step,
+            "totalSteps": steps,
+            "loss": float(loss),
+        },
+    )
+
+
 def write_control(project_dir: Path, command: str) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "control.json").write_text(
@@ -78,6 +99,15 @@ def load_pose_data(
     pose_file = project_dir / "pose.json"
     if pose_file.exists() and config.get("reload_pose", False):
         pose_file.unlink(missing_ok=True)
+    if pose_file.exists() and not config.get("reload_pose", False):
+        try:
+            cached = json.loads(pose_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = None
+        if cached and str(cached.get("source", "orbit")) == "orbit":
+            if str(config.get("pose_source", "auto")).lower() in {"auto", "colmap"}:
+                log("[data] 检测到缓存的假设位姿，重新用 COLMAP 估计真实位姿")
+                pose_file.unlink(missing_ok=True)
     if not pose_file.exists():
         inputs_file = project_dir / "inputs.json"
         if inputs_file.exists():
@@ -711,6 +741,7 @@ def train_tfrf(
     steps = int(config.get("steps", 400))
     patch = int(config.get("patch_size", 512))
     eval_every = int(config.get("eval_every", 60))
+    progress_every = int(config.get("progress_every", 10))
     sample_count = int(config.get("samples", 32))
     scene_points = (
         np.asarray(sparse_points, dtype=np.float32)[:, :3]
@@ -864,6 +895,7 @@ def train_tfrf(
             metrics.update(
                 {
                     "step": step,
+                    "totalSteps": steps,
                     "vramMB": 0,
                     "elapsed": round(time.time() - start_wall, 2),
                 }
@@ -888,6 +920,8 @@ def train_tfrf(
                     "metrics": history,
                 },
             )
+        elif step % progress_every == 0:
+            emit_training_status(project_dir, task_id, step, steps, loss)
         status_after(project_dir, task_id)
 
     return {"model": model, "history": history}, history

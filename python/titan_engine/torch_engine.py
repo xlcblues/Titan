@@ -154,6 +154,7 @@ def train_tfrf_torch(
         FacetRadianceField,
         compute_metrics,
         emit_status,
+        emit_training_status,
         log,
         ray_bounds_from_points,
         status_after,
@@ -165,6 +166,7 @@ def train_tfrf_torch(
     steps = int(config.get("steps", 400))
     patch = int(config.get("patch_size", 512))
     eval_every = int(config.get("eval_every", 60))
+    progress_every = int(config.get("progress_every", 10))
     sample_count = int(config.get("samples", 32))
     learning_rate = float(config.get("learning_rate", 0.004))
     full_image = bool(config.get("full_image", False))
@@ -269,6 +271,7 @@ def train_tfrf_torch(
             metrics.update(
                 {
                     "step": step,
+                    "totalSteps": steps,
                     "vramMB": vram_mb,
                     "elapsed": round(time.time() - start_wall, 2),
                 }
@@ -292,6 +295,14 @@ def train_tfrf_torch(
                     "vramMB": vram_mb,
                     "metrics": history,
                 },
+            )
+        elif step % progress_every == 0:
+            emit_training_status(
+                project_dir,
+                task_id,
+                step,
+                steps,
+                float(loss.detach().cpu()),
             )
         status_after(project_dir, task_id)
 

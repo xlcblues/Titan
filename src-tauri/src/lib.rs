@@ -713,7 +713,7 @@ fn get_task(db: State<'_, Db>, project_id: String) -> Result<Option<TaskInfo>, S
         if current.latest.is_none() {
             current.latest = conn
                 .query_row(
-                    "SELECT psnr, ssim, loss, vram_mb
+                    "SELECT step, psnr, ssim, loss, vram_mb
                      FROM metrics
                      WHERE task_id = ?1
                      ORDER BY step DESC
@@ -721,10 +721,11 @@ fn get_task(db: State<'_, Db>, project_id: String) -> Result<Option<TaskInfo>, S
                     [&current.id],
                     |row| {
                         Ok(json!({
-                            "psnr": row.get::<_, Option<f64>>(0)?,
-                            "ssim": row.get::<_, Option<f64>>(1)?,
-                            "loss": row.get::<_, Option<f64>>(2)?,
-                            "vramMB": row.get::<_, Option<i64>>(3)?,
+                            "step": row.get::<_, Option<i64>>(0)?,
+                            "psnr": row.get::<_, Option<f64>>(1)?,
+                            "ssim": row.get::<_, Option<f64>>(2)?,
+                            "loss": row.get::<_, Option<f64>>(3)?,
+                            "vramMB": row.get::<_, Option<i64>>(4)?,
                         }))
                     },
                 )

@@ -341,6 +341,16 @@ export function ProjectDetail() {
           </div>
           <div className="task-metrics">
             <div className="metric-row">
+              <span className="metric-row__label">步数</span>
+              <span className="metric-row__value mono">
+                {typeof task?.latest?.step === "number"
+                  ? task.latest.totalSteps
+                    ? `${task.latest.step} / ${task.latest.totalSteps}`
+                    : `${task.latest.step}`
+                  : "—"}
+              </span>
+            </div>
+            <div className="metric-row">
               <span className="metric-row__label">Loss</span>
               <span className="metric-row__value mono">
                 {formatMetric(task?.latest?.loss, 4)}

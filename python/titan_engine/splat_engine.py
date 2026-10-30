@@ -582,6 +582,7 @@ def train_tfrf_splat(
         SCENE_BACKGROUND,
         compute_metrics,
         emit_status,
+        emit_training_status,
         log,
         ray_bounds_from_points,
         scene_scale_from_cameras,
@@ -592,6 +593,7 @@ def train_tfrf_splat(
     steps = int(config.get("steps", 1200))
     patch = int(config.get("patch_size", 1024))
     eval_every = int(config.get("eval_every", 100))
+    progress_every = int(config.get("progress_every", 10))
     learning_rate = float(config.get("learning_rate", 0.02))
     render_batch = int(config.get("render_batch_size", 256))
     disk_cutoff = float(config.get("disk_cutoff", 1.8))
@@ -913,6 +915,7 @@ def train_tfrf_splat(
             metrics.update(
                 {
                     "step": step,
+                    "totalSteps": steps,
                     "vramMB": vram_mb,
                     "elapsed": round(time.time() - start_wall, 2),
                 }
@@ -936,6 +939,14 @@ def train_tfrf_splat(
                     "vramMB": vram_mb,
                     "metrics": history,
                 },
+            )
+        elif step % progress_every == 0:
+            emit_training_status(
+                project_dir,
+                task_id,
+                step,
+                steps,
+                float(loss.detach().cpu()),
             )
         status_after(project_dir, task_id)
 

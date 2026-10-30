@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface TaskMetrics {
   step?: number;
+  totalSteps?: number;
   loss?: number;
   psnr?: number;
   ssim?: number;
@@ -30,6 +31,8 @@ interface TaskEventPayload {
   status: string;
   stage: string;
   progress: number;
+  step?: number;
+  totalSteps?: number;
   error?: string;
   loss?: number;
   psnr?: number;
@@ -99,12 +102,19 @@ export function useTasks(projectId: string) {
             setHistory(payload.metrics);
           }
           const latest: TaskMetrics = payload.metrics?.length
-            ? payload.metrics[payload.metrics.length - 1]
+            ? {
+                ...payload.metrics[payload.metrics.length - 1],
+                totalSteps:
+                  payload.totalSteps ?? current.latest?.totalSteps,
+              }
             : {
+                step: payload.step,
                 loss: payload.loss,
                 psnr: payload.psnr,
                 ssim: payload.ssim,
-                vramMB: payload.vramMB,
+                vramMB: payload.vramMB ?? current.latest?.vramMB,
+                totalSteps:
+                  payload.totalSteps ?? current.latest?.totalSteps,
               };
           applyTask({
             ...current,

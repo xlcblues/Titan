@@ -20,6 +20,7 @@ export interface TaskInfo {
   status: string;
   stage: string;
   progress: number;
+  message?: string | null;
   startedAt: number | null;
   finishedAt: number | null;
   error: string | null;
@@ -31,6 +32,7 @@ interface TaskEventPayload {
   status: string;
   stage: string;
   progress: number;
+  message?: string;
   step?: number;
   totalSteps?: number;
   error?: string;
@@ -121,6 +123,7 @@ export function useTasks(projectId: string) {
             status: payload.status,
             stage: payload.stage,
             progress: payload.progress,
+            message: payload.message ?? current.message,
             error: payload.error ?? null,
             latest,
           });

@@ -1132,6 +1132,15 @@
   color: var(--text);
 }
 
+.task-stage__message {
+  margin: 0;
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
 .task-progress {
   height: 4px;
 }

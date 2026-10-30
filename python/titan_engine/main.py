@@ -97,142 +97,132 @@ def load_pose_data(
     status_cb: Callable[[float, str], None] | None = None,
 ) -> dict:
     pose_file = project_dir / "pose.json"
-    if pose_file.exists() and config.get("reload_pose", False):
-        pose_file.unlink(missing_ok=True)
-    if pose_file.exists() and not config.get("reload_pose", False):
+    cached: dict | None = None
+    if pose_file.exists():
         try:
             cached = json.loads(pose_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             cached = None
-        if cached and str(cached.get("source", "orbit")) == "orbit":
-            if str(config.get("pose_source", "auto")).lower() in {"auto", "colmap"}:
-                log("[data] 检测到缓存的假设位姿，重新用 COLMAP 估计真实位姿")
-                pose_file.unlink(missing_ok=True)
-    if not pose_file.exists():
-        inputs_file = project_dir / "inputs.json"
-        if inputs_file.exists():
-            try:
-                inputs = json.loads(inputs_file.read_text(encoding="utf-8"))
-                image_paths = [
-                    str(Path(item)) for item in inputs.get("images", [])
-                    if Path(item).exists()
-                ]
-            except (OSError, ValueError):
-                image_paths = []
-            if image_paths:
-                sparse_dir = find_sparse_dir(image_paths)
-                if sparse_dir:
-                    point_limit = int(config.get("sparse_points_limit", 2400))
-                    colmap_data = load_colmap_sparse(
-                        sparse_dir, image_paths, point_limit=point_limit
-                    )
-                    if colmap_data and colmap_data["cameras"]:
-                        colmap_data["source"] = "colmap"
-                        payload = {
-                            "cameras": colmap_data["cameras"],
-                            "points": colmap_data["points"],
-                            "source": "colmap",
-                        }
-                        pose_file.write_text(
-                            json.dumps(payload, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
-                        log(
-                            f"[data] 检测到 COLMAP 真实位姿，"
-                            f"{len(colmap_data['cameras'])} 张图片，"
-                            f"{len(colmap_data['points'])} 个稀疏点"
-                        )
-                        return {
-                            "images": [
-                                str(camera["path"])
-                                for camera in colmap_data["cameras"]
-                            ],
-                            "cameras": colmap_data["cameras"],
-                            "points": colmap_data["points"],
-                            "source": "colmap",
-                        }
-                poses_file = find_poses_bounds(image_paths)
-                if poses_file:
-                    llff_data = load_llff_poses(poses_file, image_paths)
-                    if llff_data and llff_data["cameras"]:
-                        llff_data["source"] = "llff"
-                        payload = {
-                            "cameras": llff_data["cameras"],
-                            "points": llff_data["points"],
-                            "source": "llff",
-                        }
-                        pose_file.write_text(
-                            json.dumps(payload, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
-                        log(
-                            f"[data] 检测到 LLFF 真实位姿，"
-                            f"{len(llff_data['cameras'])} 张图片"
-                        )
-                        return {
-                            "images": [
-                                str(camera["path"])
-                                for camera in llff_data["cameras"]
-                            ],
-                            "cameras": llff_data["cameras"],
-                            "points": llff_data["points"],
-                            "source": "llff",
-                        }
-                pose_source = str(config.get("pose_source", "auto")).lower()
-                if pose_source in {"auto", "colmap"}:
-                    log(f"[data] 未检测到现成位姿，开始用 COLMAP 估计 {len(image_paths)} 张图片位姿")
-                    colmap_data = run_colmap_sfm(
-                        project_dir,
-                        image_paths,
-                        config,
-                        status_cb=status_cb,
-                    )
-                    if colmap_data and colmap_data["cameras"]:
-                        payload = {
-                            "cameras": colmap_data["cameras"],
-                            "points": colmap_data["points"],
-                            "source": "colmap",
-                        }
-                        pose_file.write_text(
-                            json.dumps(payload, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
-                        return {
-                            "images": [
-                                str(camera["path"])
-                                for camera in colmap_data["cameras"]
-                            ],
-                            "cameras": colmap_data["cameras"],
-                            "points": colmap_data["points"],
-                            "source": "colmap",
-                        }
-                    log("[data] COLMAP 未产出可用位姿，回退到假设环绕位姿")
-                count = len(image_paths)
-                size = int(config.get("resolution", 192))
-                cameras = generate_orbit_pose(project_dir, image_paths, count, size)
-                images = [str(camera["path"]) for camera in cameras]
-                payload = {
-                    "cameras": cameras,
-                    "points": [],
-                    "source": "orbit",
-                }
-                pose_file.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                log(
-                    f"[data] 未检测到位姿，为 {count} 张图片生成假设环绕位姿（低精度降级）"
-                )
-                return {
-                    "images": images,
-                    "cameras": cameras,
-                    "points": [],
-                    "source": "orbit",
-                }
+    if config.get("reload_pose", False):
+        cached = None
+
+    inputs_file = project_dir / "inputs.json"
+    image_paths: list[str] = []
+    if inputs_file.exists():
+        try:
+            inputs = json.loads(inputs_file.read_text(encoding="utf-8"))
+            image_paths = [
+                str(Path(item)) for item in inputs.get("images", [])
+                if Path(item).exists()
+            ]
+        except (OSError, ValueError):
+            image_paths = []
+
+    def save_and_return(payload: dict, source: str, message: str) -> dict:
+        cameras: list[dict] = []
+        for camera in payload["cameras"]:
+            raw_path = Path(camera["path"])
+            image_path = raw_path if raw_path.is_absolute() else project_dir / raw_path
+            camera["path"] = str(image_path)
+            cameras.append(camera)
+        payload["cameras"] = cameras
+        payload["source"] = source
+        pose_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log(message)
+        return {
+            "images": [str(camera["path"]) for camera in cameras],
+            "cameras": cameras,
+            "points": payload.get("points", []),
+            "source": source,
+        }
+
+    if not image_paths:
         count = int(config.get("synthetic_views", 24))
         size = int(config.get("resolution", 192))
-        log(f"[data] 未检测到位姿，生成合成测试场景 {count} 视角 x {size}")
+        log(f"[data] 未检测到图片，生成合成测试场景 {count} 视角 x {size}")
         generate_scene(project_dir, count=count, size=size)
+        cached = None
+    else:
+        pose_source = str(config.get("pose_source", "auto")).lower()
+        want_colmap = pose_source in {"auto", "colmap"}
+
+        if want_colmap:
+            log(f"[data] 开始用 COLMAP 估计 {len(image_paths)} 张图片位姿")
+            colmap_data = run_colmap_sfm(
+                project_dir,
+                image_paths,
+                config,
+                status_cb=status_cb,
+            )
+            if colmap_data and colmap_data["cameras"]:
+                if status_cb:
+                    status_cb(
+                        0.1,
+                        f"完成，{len(colmap_data['cameras'])} 张图片注册",
+                    )
+                return save_and_return(
+                    colmap_data,
+                    "colmap",
+                    f"[data] COLMAP 位姿估计完成："
+                    f"{len(colmap_data['cameras'])} 张图片，"
+                    f"{len(colmap_data['points'])} 个稀疏点",
+                )
+            log("[data] COLMAP 未产出可用位姿，尝试已有位姿文件")
+
+        if (
+            cached
+            and cached.get("cameras")
+            and len(cached["cameras"]) == len(image_paths)
+        ):
+            source = str(cached.get("source", "orbit"))
+            return save_and_return(
+                cached,
+                source,
+                f"[data] 使用已有位姿缓存（{source}）",
+            )
+
+        sparse_dir = find_sparse_dir(image_paths)
+        if sparse_dir:
+            point_limit = int(config.get("sparse_points_limit", 2400))
+            colmap_data = load_colmap_sparse(
+                sparse_dir, image_paths, point_limit=point_limit
+            )
+            if colmap_data and colmap_data["cameras"]:
+                return save_and_return(
+                    colmap_data,
+                    "colmap",
+                    f"[data] 检测到 COLMAP 真实位姿，"
+                    f"{len(colmap_data['cameras'])} 张图片，"
+                    f"{len(colmap_data['points'])} 个稀疏点",
+                )
+
+        poses_file = find_poses_bounds(image_paths)
+        if poses_file:
+            llff_data = load_llff_poses(poses_file, image_paths)
+            if llff_data and llff_data["cameras"]:
+                return save_and_return(
+                    llff_data,
+                    "llff",
+                    f"[data] 检测到 LLFF 真实位姿，"
+                    f"{len(llff_data['cameras'])} 张图片",
+                )
+
+        count = len(image_paths)
+        size = int(config.get("resolution", 192))
+        cameras = generate_orbit_pose(project_dir, image_paths, count, size)
+        payload = {
+            "cameras": cameras,
+            "points": [],
+        }
+        return save_and_return(
+            payload,
+            "orbit",
+            f"[data] 未检测到位姿，为 {count} 张图片生成假设环绕位姿（低精度降级）",
+        )
+
     payload = json.loads(pose_file.read_text(encoding="utf-8"))
     images = []
     cameras = []

@@ -48,7 +48,7 @@ function taskStatusMeta(status: string | undefined) {
 function stageLabel(stage: string | undefined) {
   const labels: Record<string, string> = {
     data: "数据准备",
-    sfm: "位姿估计",
+    sfm: "COLMAP 位姿估计",
     training: "TFRF 训练",
     render: "渲染导出",
     done: "完成",
@@ -323,6 +323,9 @@ export function ProjectDetail() {
                   {task ? `${Math.round(task.progress * 100)}%` : "—"}
                 </span>
               </div>
+              {task?.message ? (
+                <p className="task-stage__message mono">{task.message}</p>
+              ) : null}
               <div
                 className="task-progress"
                 role="progressbar"

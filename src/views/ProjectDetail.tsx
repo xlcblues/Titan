@@ -48,6 +48,7 @@ function taskStatusMeta(status: string | undefined) {
 function stageLabel(stage: string | undefined) {
   const labels: Record<string, string> = {
     data: "数据准备",
+    sfm: "位姿估计",
     training: "TFRF 训练",
     render: "渲染导出",
     done: "完成",

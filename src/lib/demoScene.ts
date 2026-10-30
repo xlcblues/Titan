@@ -31,6 +31,7 @@ export interface TitanSceneData {
   engine?: string;
   taskId?: string;
   projectDir?: string;
+  poseSource?: string;
   points: number[][];
   cameras: TitanCamera[];
   renders?: { name: string; path: string; view: string }[];

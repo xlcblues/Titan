@@ -792,7 +792,14 @@ fn start_reconstruction(
         "sparse_points_limit": 12000,
         "background_residual_weight": 0.0,
         "disk_cutoff": 1.8,
-        "falloff_power": 1.0
+        "falloff_power": 1.0,
+        "pose_source": "auto",
+        "colmap_path": "",
+        "sfm_matcher": "sequential",
+        "sfm_max_image_size": 1600,
+        "sfm_min_images": 4,
+        "sfm_min_registered": 4,
+        "sfm_use_gpu": true
     });
     if let Some(user_config) = config {
         if let Some(object) = user_config.as_object() {

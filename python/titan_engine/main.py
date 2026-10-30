@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 # Anaconda ships OpenMP with several packages; keep the duplicate runtime
 # warning from aborting the sidecar process.
@@ -16,6 +17,7 @@ import numpy as np
 from PIL import Image
 
 from . import __version__
+from .colmap_sfm import run_colmap_sfm
 from .colmap_io import find_poses_bounds, find_sparse_dir, load_colmap_sparse, load_llff_poses
 from .metrics import psnr as compute_psnr, ssim as compute_ssim
 from .synthetic import generate_scene, sphere_color_array
@@ -68,7 +70,11 @@ def encode_direction(directions: np.ndarray, levels: int = 5) -> np.ndarray:
     return np.concatenate(values, axis=-1)
 
 
-def load_pose_data(project_dir: Path, config: dict) -> dict:
+def load_pose_data(
+    project_dir: Path,
+    config: dict,
+    status_cb: Callable[[float, str], None] | None = None,
+) -> dict:
     pose_file = project_dir / "pose.json"
     if pose_file.exists() and config.get("reload_pose", False):
         pose_file.unlink(missing_ok=True)
@@ -91,9 +97,11 @@ def load_pose_data(project_dir: Path, config: dict) -> dict:
                         sparse_dir, image_paths, point_limit=point_limit
                     )
                     if colmap_data and colmap_data["cameras"]:
+                        colmap_data["source"] = "colmap"
                         payload = {
                             "cameras": colmap_data["cameras"],
                             "points": colmap_data["points"],
+                            "source": "colmap",
                         }
                         pose_file.write_text(
                             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -111,14 +119,17 @@ def load_pose_data(project_dir: Path, config: dict) -> dict:
                             ],
                             "cameras": colmap_data["cameras"],
                             "points": colmap_data["points"],
+                            "source": "colmap",
                         }
                 poses_file = find_poses_bounds(image_paths)
                 if poses_file:
                     llff_data = load_llff_poses(poses_file, image_paths)
                     if llff_data and llff_data["cameras"]:
+                        llff_data["source"] = "llff"
                         payload = {
                             "cameras": llff_data["cameras"],
                             "points": llff_data["points"],
+                            "source": "llff",
                         }
                         pose_file.write_text(
                             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -135,18 +146,58 @@ def load_pose_data(project_dir: Path, config: dict) -> dict:
                             ],
                             "cameras": llff_data["cameras"],
                             "points": llff_data["points"],
+                            "source": "llff",
                         }
+                pose_source = str(config.get("pose_source", "auto")).lower()
+                if pose_source in {"auto", "colmap"}:
+                    log(f"[data] 未检测到现成位姿，开始用 COLMAP 估计 {len(image_paths)} 张图片位姿")
+                    colmap_data = run_colmap_sfm(
+                        project_dir,
+                        image_paths,
+                        config,
+                        status_cb=status_cb,
+                    )
+                    if colmap_data and colmap_data["cameras"]:
+                        payload = {
+                            "cameras": colmap_data["cameras"],
+                            "points": colmap_data["points"],
+                            "source": "colmap",
+                        }
+                        pose_file.write_text(
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        return {
+                            "images": [
+                                str(camera["path"])
+                                for camera in colmap_data["cameras"]
+                            ],
+                            "cameras": colmap_data["cameras"],
+                            "points": colmap_data["points"],
+                            "source": "colmap",
+                        }
+                    log("[data] COLMAP 未产出可用位姿，回退到假设环绕位姿")
                 count = len(image_paths)
                 size = int(config.get("resolution", 192))
+                cameras = generate_orbit_pose(project_dir, image_paths, count, size)
+                images = [str(camera["path"]) for camera in cameras]
+                payload = {
+                    "cameras": cameras,
+                    "points": [],
+                    "source": "orbit",
+                }
+                pose_file.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
                 log(
                     f"[data] 未检测到位姿，为 {count} 张图片生成假设环绕位姿（低精度降级）"
                 )
-                cameras = generate_orbit_pose(project_dir, image_paths, count, size)
-                images = [str(camera["path"]) for camera in cameras]
                 return {
                     "images": images,
                     "cameras": cameras,
                     "points": [],
+                    "source": "orbit",
                 }
         count = int(config.get("synthetic_views", 24))
         size = int(config.get("resolution", 192))
@@ -156,13 +207,19 @@ def load_pose_data(project_dir: Path, config: dict) -> dict:
     images = []
     cameras = []
     for camera in payload["cameras"]:
-        image_path = project_dir / camera["path"]
+        raw_path = Path(camera["path"])
+        image_path = raw_path if raw_path.is_absolute() else project_dir / raw_path
         if not image_path.exists():
             continue
         camera["path"] = str(image_path)
         images.append(str(image_path))
         cameras.append(camera)
-    return {"images": images, "cameras": cameras, "points": payload.get("points", [])}
+    return {
+        "images": images,
+        "cameras": cameras,
+        "points": payload.get("points", []),
+        "source": payload.get("source", "orbit"),
+    }
 
 
 def generate_orbit_pose(
@@ -851,6 +908,7 @@ def write_render(
 def write_scene_output(
     project_dir: Path,
     task_id: str,
+    pose_source: str,
     cameras: list[dict],
     sparse_points: list[list[float]],
     final_metrics: dict,
@@ -865,6 +923,7 @@ def write_scene_output(
         "engine": engine,
         "taskId": task_id,
         "projectDir": str(project_dir),
+        "poseSource": pose_source,
         "points": sparse_points,
         "cameras": [
             {
@@ -909,7 +968,20 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         {"taskId": task_id, "status": "running", "stage": "data", "progress": 0.02},
     )
 
-    data = load_pose_data(project_dir, config)
+    data = load_pose_data(
+        project_dir,
+        config,
+        status_cb=lambda progress, message: emit_status(
+            project_dir,
+            {
+                "taskId": task_id,
+                "status": "running",
+                "stage": "sfm",
+                "progress": progress,
+                "message": f"COLMAP {message}",
+            },
+        ),
+    )
     if not data["images"]:
         raise RuntimeError("项目没有可用图片或位姿")
     images = load_and_prepare_images(data["images"], data["cameras"], config)
@@ -1015,6 +1087,7 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
     write_scene_output(
         project_dir,
         task_id,
+        str(data.get("source", "orbit")),
         data["cameras"],
         sparse_points,
         final_metrics,

@@ -202,6 +202,7 @@ def load_colmap_sparse(
     sparse_dir: Path,
     image_paths: list[str],
     point_limit: int = 2400,
+    path_map: dict[str, str] | None = None,
 ) -> dict | None:
     """Load COLMAP poses and sparse points aligned to the input images."""
     sparse_dir = Path(sparse_dir)
@@ -218,20 +219,37 @@ def load_colmap_sparse(
         by_name.setdefault(name, record)
 
     matched: list[dict] = []
-    for image_path in image_paths:
-        record = by_name.get(Path(image_path).stem.lower())
-        if record is None or record["camera_id"] not in cameras:
-            continue
-        camera = cameras[record["camera_id"]]
-        matched.append(
-            {
-                "path": str(image_path),
-                "width": int(camera["width"]),
-                "height": int(camera["height"]),
-                "K": [row[:] for row in camera["K"]],
-                "c2w": camera_to_world(record["qvec"], record["tvec"]).tolist(),
-            }
-        )
+    if path_map:
+        for record in image_records:
+            name = record["name"]
+            image_path = path_map.get(name)
+            if image_path is None or record["camera_id"] not in cameras:
+                continue
+            camera = cameras[record["camera_id"]]
+            matched.append(
+                {
+                    "path": image_path,
+                    "width": int(camera["width"]),
+                    "height": int(camera["height"]),
+                    "K": [row[:] for row in camera["K"]],
+                    "c2w": camera_to_world(record["qvec"], record["tvec"]).tolist(),
+                }
+            )
+    else:
+        for image_path in image_paths:
+            record = by_name.get(Path(image_path).stem.lower())
+            if record is None or record["camera_id"] not in cameras:
+                continue
+            camera = cameras[record["camera_id"]]
+            matched.append(
+                {
+                    "path": str(image_path),
+                    "width": int(camera["width"]),
+                    "height": int(camera["height"]),
+                    "K": [row[:] for row in camera["K"]],
+                    "c2w": camera_to_world(record["qvec"], record["tvec"]).tolist(),
+                }
+            )
     if not matched:
         return None
 

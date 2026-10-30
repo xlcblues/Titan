@@ -117,6 +117,10 @@ export function Scene() {
   }, [renderFilter, scene]);
 
   const config = scene?.config ?? null;
+  const poseSource =
+    scene?.poseSource ??
+    (typeof config?.pose_source === "string" ? config.pose_source : "orbit");
+  const realPose = poseSource === "colmap" || poseSource === "llff";
   const configRows = config
     ? [
         {
@@ -169,12 +173,20 @@ export function Scene() {
   const progress = scene ? 100 : 32;
   const pipeline = scene
     ? [
-        { name: "SfM 位姿估计", label: "完成", tone: "success" as const },
+        {
+          name: "SfM 位姿估计",
+          label: realPose ? "完成" : "假设位姿",
+          tone: realPose ? "success" as const : "warning" as const,
+        },
         { name: "TFRF 训练", label: "完成", tone: "success" as const },
         { name: "渲染导出", label: "完成", tone: "success" as const },
       ]
     : [
-        { name: "SfM 位姿估计", label: "完成", tone: "success" as const },
+        {
+          name: "SfM 位姿估计",
+          label: "完成",
+          tone: "success" as const,
+        },
         { name: "TFRF 训练", label: "进行中", tone: "accent" as const },
         { name: "渲染导出", label: "等待", tone: "neutral" as const },
       ];

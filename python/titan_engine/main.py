@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image
 
 from . import __version__
+from .colmap_io import find_poses_bounds, find_sparse_dir, load_colmap_sparse, load_llff_poses
 from .metrics import psnr as compute_psnr, ssim as compute_ssim
 from .synthetic import generate_scene, sphere_color_array
 
@@ -69,6 +70,8 @@ def encode_direction(directions: np.ndarray, levels: int = 5) -> np.ndarray:
 
 def load_pose_data(project_dir: Path, config: dict) -> dict:
     pose_file = project_dir / "pose.json"
+    if pose_file.exists() and config.get("reload_pose", False):
+        pose_file.unlink(missing_ok=True)
     if not pose_file.exists():
         inputs_file = project_dir / "inputs.json"
         if inputs_file.exists():
@@ -81,8 +84,60 @@ def load_pose_data(project_dir: Path, config: dict) -> dict:
             except (OSError, ValueError):
                 image_paths = []
             if image_paths:
+                sparse_dir = find_sparse_dir(image_paths)
+                if sparse_dir:
+                    point_limit = int(config.get("sparse_points_limit", 2400))
+                    colmap_data = load_colmap_sparse(
+                        sparse_dir, image_paths, point_limit=point_limit
+                    )
+                    if colmap_data and colmap_data["cameras"]:
+                        payload = {
+                            "cameras": colmap_data["cameras"],
+                            "points": colmap_data["points"],
+                        }
+                        pose_file.write_text(
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        log(
+                            f"[data] 检测到 COLMAP 真实位姿，"
+                            f"{len(colmap_data['cameras'])} 张图片，"
+                            f"{len(colmap_data['points'])} 个稀疏点"
+                        )
+                        return {
+                            "images": [
+                                str(camera["path"])
+                                for camera in colmap_data["cameras"]
+                            ],
+                            "cameras": colmap_data["cameras"],
+                            "points": colmap_data["points"],
+                        }
+                poses_file = find_poses_bounds(image_paths)
+                if poses_file:
+                    llff_data = load_llff_poses(poses_file, image_paths)
+                    if llff_data and llff_data["cameras"]:
+                        payload = {
+                            "cameras": llff_data["cameras"],
+                            "points": llff_data["points"],
+                        }
+                        pose_file.write_text(
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        log(
+                            f"[data] 检测到 LLFF 真实位姿，"
+                            f"{len(llff_data['cameras'])} 张图片"
+                        )
+                        return {
+                            "images": [
+                                str(camera["path"])
+                                for camera in llff_data["cameras"]
+                            ],
+                            "cameras": llff_data["cameras"],
+                            "points": llff_data["points"],
+                        }
                 count = len(image_paths)
-                size = int(config.get("resolution", 256))
+                size = int(config.get("resolution", 192))
                 log(
                     f"[data] 未检测到位姿，为 {count} 张图片生成假设环绕位姿（低精度降级）"
                 )
@@ -94,7 +149,7 @@ def load_pose_data(project_dir: Path, config: dict) -> dict:
                     "points": [],
                 }
         count = int(config.get("synthetic_views", 24))
-        size = int(config.get("resolution", 256))
+        size = int(config.get("resolution", 192))
         log(f"[data] 未检测到位姿，生成合成测试场景 {count} 视角 x {size}")
         generate_scene(project_dir, count=count, size=size)
     payload = json.loads(pose_file.read_text(encoding="utf-8"))
@@ -175,44 +230,212 @@ def load_and_prepare_images(
     cameras: list[dict],
     config: dict,
 ) -> np.ndarray:
-    """Load images and normalize them to the training resolution.
+    """Load images and normalize them to a square training grid.
 
-    Real captures often have mixed sizes; the M4 baseline resizes every
-    input to a square training resolution and rebuilds a matching pinhole
-    camera so the splat renderer and metrics share one consistent grid.
+    Images keep their original aspect ratio: each frame is scaled to fit
+    inside the square target and letterboxed. Camera intrinsics are scaled
+    by the same factor and shifted by the letterbox offset, so focal length
+    and principal point are not discarded as they were in the M4 baseline.
     """
-    resolution = int(config.get("resolution", 256))
+    resolution = int(config.get("resolution", 192))
     target = (resolution, resolution)
     images = []
+    actual_sizes: list[tuple[int, int]] = []
     for path in paths:
         with Image.open(path) as source:
             image = source.convert("RGB")
-            if image.size != target:
-                image = image.resize(target, Image.LANCZOS)
-            images.append(np.asarray(image, dtype=np.float32) / 255.0)
-    focal = resolution * 1.15
-    for camera in cameras:
+            source_width, source_height = image.size
+            actual_sizes.append((source_width, source_height))
+            scale = min(resolution / source_width, resolution / source_height)
+            scaled_size = (
+                max(1, round(source_width * scale)),
+                max(1, round(source_height * scale)),
+            )
+            scaled = image.resize(scaled_size, Image.LANCZOS)
+            canvas = Image.new("RGB", target, (0, 0, 0))
+            offset_x = (resolution - scaled_size[0]) // 2
+            offset_y = (resolution - scaled_size[1]) // 2
+            canvas.paste(scaled, (offset_x, offset_y))
+            images.append(np.asarray(canvas, dtype=np.float32) / 255.0)
+
+    for index, camera in enumerate(cameras):
+        if index >= len(paths):
+            break
+        actual_width, actual_height = actual_sizes[index]
+        source_width = max(1, int(camera.get("width", actual_width)))
+        source_height = max(1, int(camera.get("height", actual_height)))
+        source_k = camera.get("K")
+        if source_k is None or not source_k:
+            focal_source = max(actual_width, actual_height) * 1.15
+            source_k = [
+                [focal_source, 0.0, actual_width / 2.0],
+                [0.0, focal_source, actual_height / 2.0],
+                [0.0, 0.0, 1.0],
+            ]
+        if (
+            abs(source_width - actual_width) > 1
+            or abs(source_height - actual_height) > 1
+        ):
+            scale_x = actual_width / source_width
+            scale_y = actual_height / source_height
+            source_k = [
+                [float(source_k[0][0]) * scale_x, 0.0, float(source_k[0][2]) * scale_x],
+                [0.0, float(source_k[1][1]) * scale_y, float(source_k[1][2]) * scale_y],
+                [0.0, 0.0, 1.0],
+            ]
+        scale = min(resolution / actual_width, resolution / actual_height)
+        scaled_width = max(1, round(actual_width * scale))
+        scaled_height = max(1, round(actual_height * scale))
+        offset_x = (resolution - scaled_width) / 2.0
+        offset_y = (resolution - scaled_height) / 2.0
+        fx = float(source_k[0][0]) * scale
+        fy = float(source_k[1][1]) * scale
+        cx = float(source_k[0][2]) * scale + offset_x
+        cy = float(source_k[1][2]) * scale + offset_y
         camera["width"] = resolution
         camera["height"] = resolution
         camera["K"] = [
-            [focal, 0.0, resolution / 2.0],
-            [0.0, focal, resolution / 2.0],
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
             [0.0, 0.0, 1.0],
         ]
     return np.stack(images, axis=0)
 
 
 def build_sparse_points(cameras: list[dict], count: int = 2400) -> list[list[float]]:
+    """Build an initialization cloud that follows the observed camera rays.
+
+    The baseline M3/M4 used a fixed synthetic sphere, which rendered as an
+    empty scene whenever the real cameras are far from the origin or observe
+    a much smaller object. This version triangulates camera ray pairs and
+    fills the volume that is actually visible from the cameras.
+    """
+    count = max(int(count), 64)
     rng = np.random.default_rng(7)
-    directions = rng.normal(size=(count, 3))
-    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
-    radii = 2.0 + 0.08 * rng.normal(size=(count, 1))
-    points = directions * radii
+    cameras_np = np.asarray(
+        [np.asarray(camera["c2w"], dtype=np.float32) for camera in cameras]
+    )
+    if cameras_np.ndim != 3 or cameras_np.shape[0] < 2:
+        # No real poses: keep the old sphere fallback at a neutral scale.
+        directions = rng.normal(size=(count, 3))
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        radii = 2.0 + 0.08 * rng.normal(size=(count, 1))
+        points = directions * radii
+        colors = (sphere_color_array(points) * 255.0).astype(np.uint8)
+        return [
+            [float(x), float(y), float(z), int(r), int(g), int(b)]
+            for (x, y, z), (r, g, b) in zip(points, colors)
+        ]
+
+    positions = cameras_np[:, :3, 3]
+    forwards = cameras_np[:, :3, 2]
+    centroid = np.mean(positions, axis=0)
+    typical_depth = float(
+        np.median(
+            np.linalg.norm(positions - centroid[None, :], axis=1)
+        )
+    )
+    if typical_depth <= 1e-6:
+        typical_depth = 1.0
+
+    def triangulate_pair(index_a: int, index_b: int) -> np.ndarray:
+        origin_a, forward_a = positions[index_a], forwards[index_a]
+        origin_b, forward_b = positions[index_b], forwards[index_b]
+        origin_b -= origin_a
+        dot_aa = float(np.dot(forward_a, forward_a))
+        dot_bb = float(np.dot(forward_b, forward_b))
+        dot_ab = float(np.dot(forward_a, forward_b))
+        denom = dot_aa * dot_bb - dot_ab * dot_ab
+        if abs(denom) < 1e-8:
+            return np.empty((0, 3), dtype=np.float32)
+        origin_b_dot_a = float(np.dot(origin_b, forward_a))
+        origin_b_dot_b = float(np.dot(origin_b, forward_b))
+        t_a = (dot_bb * origin_b_dot_a - dot_ab * origin_b_dot_b) / denom
+        t_b = (dot_ab * origin_b_dot_a - dot_aa * origin_b_dot_b) / denom
+        if t_a < 0.05 or t_b < 0.05:
+            return np.empty((0, 3), dtype=np.float32)
+        point = origin_a + forward_a * t_a
+        return np.asarray([point], dtype=np.float32)
+
+    triangulated: list[np.ndarray] = []
+    cameras_count = len(cameras_np)
+    step = max(1, cameras_count // 40)
+    pair_count = 0
+    for index_a in range(0, cameras_count, step):
+        index_b = (index_a + cameras_count // 2) % cameras_count
+        if index_b == index_a:
+            continue
+        point = triangulate_pair(index_a, index_b)
+        if point.size == 0:
+            continue
+        # Keep points that land in front of both cameras and near their axes;
+        # this filters degenerate triangulations without requiring a sparse SfM.
+        depth_a = float(
+            np.dot(point[0] - positions[index_a], forwards[index_a])
+        )
+        depth_b = float(
+            np.dot(point[0] - positions[index_b], forwards[index_b])
+        )
+        lateral_a = float(
+            np.linalg.norm(
+                point[0] - positions[index_a] - forwards[index_a] * depth_a
+            )
+        )
+        lateral_b = float(
+            np.linalg.norm(
+                point[0] - positions[index_b] - forwards[index_b] * depth_b
+            )
+        )
+        if depth_a < 0.05 or depth_b < 0.05:
+            continue
+        if lateral_a > typical_depth * 0.6 or lateral_b > typical_depth * 0.6:
+            continue
+        if max(depth_a, depth_b) > typical_depth * 4.0:
+            continue
+        triangulated.append(point)
+        pair_count += 1
+        if pair_count >= count // 2:
+            break
+
+    if triangulated:
+        anchors = np.concatenate(triangulated, axis=0)
+        radius = float(np.median(np.linalg.norm(anchors - centroid, axis=1)))
+        if radius <= 1e-6:
+            radius = typical_depth * 0.4
+        spread = max(radius * 0.12, typical_depth * 0.02)
+        indices = rng.integers(0, len(anchors), size=count)
+        points = anchors[indices] + rng.normal(scale=spread, size=(count, 3))
+    else:
+        # Very few useful intersections: seed a shell at the typical distance
+        # in front of each camera so every view still has initial content.
+        shells: list[np.ndarray] = []
+        per_camera = max(4, count // max(cameras_count, 1))
+        for index in range(cameras_count):
+            depth = typical_depth * rng.uniform(0.55, 1.15, size=per_camera)
+            shells.append(
+                positions[index][None, :] + forwards[index][None, :] * depth[:, None]
+            )
+        points = np.concatenate(shells, axis=0)[:count]
+
     colors = (sphere_color_array(points) * 255.0).astype(np.uint8)
     return [
         [float(x), float(y), float(z), int(r), int(g), int(b)]
         for (x, y, z), (r, g, b) in zip(points, colors)
     ]
+
+
+def scene_scale_from_cameras(cameras: list[dict]) -> float:
+    """Estimate a typical object distance from the camera layout."""
+    positions = np.asarray(
+        [np.asarray(camera["c2w"], dtype=np.float32)[:3, 3] for camera in cameras]
+    )
+    if len(positions) == 0:
+        return 1.0
+    centroid = np.mean(positions, axis=0)
+    median = float(np.median(np.linalg.norm(positions - centroid, axis=1)))
+    if not np.isfinite(median) or median <= 1e-6:
+        return 1.0
+    return median
 
 
 class FacetRadianceField:
@@ -266,15 +489,44 @@ def render_rays(
     return rendered
 
 
+def ray_bounds_from_points(
+    origin: np.ndarray,
+    points: np.ndarray,
+    near_fraction: float = 0.75,
+    far_fraction: float = 1.35,
+) -> tuple[float, float]:
+    """Choose near/far from the actual point distribution seen by a camera."""
+    if len(points) == 0:
+        return 0.3, 7.6
+    depths = np.linalg.norm(points - np.asarray(origin, dtype=np.float32), axis=1)
+    lower = float(np.percentile(depths, 5.0))
+    upper = float(np.percentile(depths, 95.0))
+    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= 1e-6:
+        return 0.3, 7.6
+    near = max(lower * near_fraction, 1e-4)
+    far = max(upper * far_fraction, near * 1.2)
+    return near, far
+
+
 def render_view(
     model: FacetRadianceField,
     camera: dict,
     background: np.ndarray,
+    scene_points: np.ndarray | None = None,
+    disk_cutoff: float = 2.2,
+    falloff_power: float = 1.0,
 ) -> np.ndarray:
     if hasattr(model, "positions") and hasattr(model, "color_logits"):
         from .splat_engine import render_splats_view
 
-        return render_splats_view(model, camera, background)
+        return render_splats_view(
+            model,
+            camera,
+            background,
+            scene_points=scene_points,
+            disk_cutoff=disk_cutoff,
+            falloff_power=falloff_power,
+        )
     c2w = np.asarray(camera["c2w"], dtype=np.float32)
     k = camera["K"]
     width, height = camera["width"], camera["height"]
@@ -286,7 +538,14 @@ def render_view(
     directions = local @ rotation.T
     directions = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
     flat_dirs = directions.reshape(-1, 3)
-    rendered = render_rays(model, origin, flat_dirs, background=background)
+    near, far = (
+        ray_bounds_from_points(origin, scene_points)
+        if scene_points is not None and len(scene_points)
+        else (2.4, 7.6)
+    )
+    rendered = render_rays(
+        model, origin, flat_dirs, near=near, far=far, background=background
+    )
     return rendered.reshape(height, width, 3)
 
 
@@ -396,6 +655,11 @@ def train_tfrf(
     patch = int(config.get("patch_size", 512))
     eval_every = int(config.get("eval_every", 60))
     sample_count = int(config.get("samples", 32))
+    scene_points = (
+        np.asarray(sparse_points, dtype=np.float32)[:, :3]
+        if sparse_points
+        else np.empty((0, 3), dtype=np.float32)
+    )
 
     train_cameras = cameras[:train_count]
     eval_cameras = cameras[train_count:]
@@ -448,14 +712,21 @@ def train_tfrf(
         directions = local @ rotation.T
         directions = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
 
+        near, far = ray_bounds_from_points(origin, scene_points)
         rendered = render_rays(
-            model, origin, directions, samples=sample_count, background=background
+            model,
+            origin,
+            directions,
+            near=near,
+            far=far,
+            samples=sample_count,
+            background=background,
         )
         target = images[int(camera_choices[step])][ys, xs]
         grad = 2.0 * (rendered - target)
         loss = float(np.mean((rendered - target) ** 2))
 
-        depth = np.linspace(2.4, 7.6, sample_count)
+        depth = np.linspace(near, far, sample_count)
         points = origin[None, None, :] + depth[:, None, None] * directions[None, :, :]
         dirs = np.broadcast_to(directions[None, :, :], points.shape)
         encoded = np.concatenate(
@@ -523,7 +794,14 @@ def train_tfrf(
         if step % eval_every == 0 or step == steps - 1:
             eval_index = (step // eval_every) % len(eval_cameras)
             eval_camera = eval_cameras[eval_index]
-            rendered_view = render_view(model, eval_camera, background)
+            rendered_view = render_view(
+                model,
+                eval_camera,
+                background,
+                scene_points=scene_points,
+                disk_cutoff=float(config.get("disk_cutoff", 2.2)),
+                falloff_power=float(config.get("falloff_power", 1.0)),
+            )
             target_view = images[len(cameras) - len(eval_cameras) + eval_index]
             metrics = compute_metrics(rendered_view, target_view)
             metrics.update(
@@ -672,10 +950,22 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
     )
     background = SCENE_BACKGROUND
     render_paths: list[dict] = []
+    scene_points_np = (
+        np.asarray(sparse_points, dtype=np.float32)[:, :3]
+        if sparse_points
+        else np.empty((0, 3), dtype=np.float32)
+    )
     for index in (0, 2, 4):
         if index >= len(data["cameras"]):
             break
-        rendered = render_view(trained, data["cameras"][index], background)
+        rendered = render_view(
+            trained,
+            data["cameras"][index],
+            background,
+            scene_points=scene_points_np,
+            disk_cutoff=float(config.get("disk_cutoff", 2.2)),
+            falloff_power=float(config.get("falloff_power", 1.0)),
+        )
         path = write_render(project_dir, f"render_train_{index:03d}.png", rendered)
         render_paths.append(
             {"name": f"render_train_{index:03d}.png", "path": path, "view": "train"}
@@ -687,7 +977,14 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         heldout = data["cameras"][-1:]
     heldout_scores = []
     for index, camera in enumerate(heldout):
-        rendered = render_view(trained, camera, background)
+        rendered = render_view(
+            trained,
+            camera,
+            background,
+            scene_points=scene_points_np,
+            disk_cutoff=float(config.get("disk_cutoff", 2.2)),
+            falloff_power=float(config.get("falloff_power", 1.0)),
+        )
         path = write_render(project_dir, f"render_eval_{index:03d}.png", rendered)
         render_paths.append(
             {"name": f"render_eval_{index:03d}.png", "path": path, "view": "eval"}
@@ -696,8 +993,15 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         target = images[target_index]
         heldout_scores.append(compute_metrics(rendered, target))
 
-    novel = orbit_camera(0.7, int(config.get("resolution", 256)))
-    rendered = render_view(trained, novel, background)
+    novel = orbit_camera(0.7, int(config.get("resolution", 192)))
+    rendered = render_view(
+        trained,
+        novel,
+        background,
+        scene_points=scene_points_np,
+        disk_cutoff=float(config.get("disk_cutoff", 2.2)),
+        falloff_power=float(config.get("falloff_power", 1.0)),
+    )
     novel_path = write_render(project_dir, "novel_orbit.png", rendered)
 
     final_metrics = {

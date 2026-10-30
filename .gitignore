@@ -26,3 +26,6 @@ __pycache__/
 *.njsproj
 *.sln
 *.sw?
+
+# Temporary experiment workspaces
+/.tmp_*/

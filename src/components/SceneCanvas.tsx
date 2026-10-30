@@ -1,4 +1,9 @@
-import { useEffect, useRef } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+} from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import {
@@ -16,6 +21,10 @@ export interface SceneStats {
   fps: number;
 }
 
+export interface SceneCanvasHandle {
+  resetView(): void;
+}
+
 interface SceneCanvasProps {
   mode: SceneMode;
   onStats: (stats: SceneStats) => void;
@@ -30,9 +39,13 @@ function disposeMaterial(material: THREE.Material | THREE.Material[]) {
   }
 }
 
-export function SceneCanvas({ mode, onStats, scene }: SceneCanvasProps) {
+export const SceneCanvas = forwardRef<
+  SceneCanvasHandle,
+  SceneCanvasProps
+>(function SceneCanvas({ mode, onStats, scene }, ref) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const demoRef = useRef<SceneBundle | null>(null);
+  const resetViewRef = useRef<() => void>(() => {});
   const modeRef = useRef(mode);
   const onStatsRef = useRef(onStats);
   const statsRef = useRef<SceneStats>({
@@ -44,6 +57,15 @@ export function SceneCanvas({ mode, onStats, scene }: SceneCanvasProps) {
 
   modeRef.current = mode;
   onStatsRef.current = onStats;
+  useImperativeHandle(
+    ref,
+    () => ({
+      resetView() {
+        resetViewRef.current();
+      },
+    }),
+    [],
+  );
 
   useEffect(() => {
     demoRef.current?.setMode(mode);
@@ -63,22 +85,17 @@ export function SceneCanvas({ mode, onStats, scene }: SceneCanvasProps) {
 
     const world = new THREE.Scene();
     world.background = new THREE.Color("#0B1116");
-    world.fog = new THREE.Fog("#0B1116", 9, 18);
 
     const camera = new THREE.PerspectiveCamera(
       48,
       container.clientWidth / container.clientHeight,
-      0.1,
-      60,
+      0.01,
+      120,
     );
-    camera.position.set(4.4, 2.7, 4.6);
 
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 0.25, 0);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
-    controls.minDistance = 1.6;
-    controls.maxDistance = 14;
     controls.maxPolarAngle = Math.PI * 0.92;
 
     world.add(new THREE.AmbientLight("#E6F7F5", 0.9));
@@ -93,6 +110,32 @@ export function SceneCanvas({ mode, onStats, scene }: SceneCanvasProps) {
     bundle.setMode(modeRef.current);
     world.add(bundle.group);
     demoRef.current = bundle;
+    const center = bundle.sceneCenter;
+    const radius = Math.max(bundle.sceneRadius, 1e-3);
+    const fitDistance = Math.max(radius * 2.4, 1.2);
+    const offset = new THREE.Vector3(0.68, 0.42, 0.68)
+      .normalize()
+      .multiplyScalar(fitDistance);
+    camera.near = Math.max(radius * 0.002, 0.01);
+    camera.far = Math.max(radius * 60, 20);
+    camera.position.copy(center).add(offset);
+    camera.updateProjectionMatrix();
+    controls.target.copy(center);
+    controls.minDistance = Math.max(radius * 0.04, 0.05);
+    controls.maxDistance = Math.max(radius * 12, 12);
+    world.fog = new THREE.Fog(
+      "#0B1116",
+      radius * 4,
+      radius * 9,
+    );
+    const homePosition = camera.position.clone();
+    const homeTarget = controls.target.clone();
+    resetViewRef.current = () => {
+      camera.position.copy(homePosition);
+      controls.target.copy(homeTarget);
+      controls.update();
+    };
+    bundle.setViewCamera(camera);
     statsRef.current = {
       pointCount: bundle.pointCount,
       cameraCount: bundle.cameraCount,
@@ -179,6 +222,8 @@ export function SceneCanvas({ mode, onStats, scene }: SceneCanvasProps) {
         } else if (object instanceof THREE.Line) {
           object.geometry.dispose();
           disposeMaterial(object.material);
+        } else if (object instanceof THREE.Sprite) {
+          disposeMaterial(object.material);
         }
       });
       demoRef.current = null;
@@ -186,4 +231,4 @@ export function SceneCanvas({ mode, onStats, scene }: SceneCanvasProps) {
   }, [scene]);
 
   return <div className="scene-canvas" ref={containerRef} aria-hidden="true" />;
-}
+});

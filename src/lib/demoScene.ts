@@ -7,10 +7,14 @@ export interface SceneBundle {
   points: THREE.Points;
   mesh: THREE.Group;
   cameraPath: THREE.Group;
+  markers: THREE.Sprite[];
   selection: THREE.Mesh;
   pointCount: number;
   cameraCount: number;
+  sceneCenter: THREE.Vector3;
+  sceneRadius: number;
   setMode(mode: SceneMode): void;
+  setViewCamera(camera: THREE.PerspectiveCamera): void;
   update(elapsed: number): void;
 }
 
@@ -40,7 +44,26 @@ const ACCENT = "#2ED3BE";
 const GOLD = "#D9A84C";
 const MESH_COLOR = "#9AAFB8";
 
-function buildPointCloud(count: number): THREE.Points {
+function makeCircleTexture(): THREE.Texture {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return new THREE.Texture(canvas);
+  }
+  const gradient = context.createRadialGradient(32, 32, 2, 32, 32, 30);
+  gradient.addColorStop(0, "rgba(214, 250, 245, 0.95)");
+  gradient.addColorStop(0.6, "rgba(46, 211, 190, 0.62)");
+  gradient.addColorStop(1, "rgba(46, 211, 190, 0)");
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 64, 64);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function buildPointCloud(count: number, radius: number): THREE.Points {
   const positions = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const teal = new THREE.Color(ACCENT);
@@ -72,7 +95,7 @@ function buildPointCloud(count: number): THREE.Points {
   geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 
   const material = new THREE.PointsMaterial({
-    size: 0.045,
+    size: Math.max(radius * 0.02, 0.03),
     vertexColors: true,
     transparent: true,
     opacity: 0.92,
@@ -119,11 +142,17 @@ function buildMesh(): THREE.Group {
   return group;
 }
 
-function buildCameraPath(frames: number): {
+function buildCameraPath(
+  frames: number,
+  radius: number,
+): {
   path: THREE.Group;
   curve: THREE.CatmullRomCurve3;
   scanner: THREE.Mesh;
+  markers: THREE.Sprite[];
 } {
+  const circleTexture = makeCircleTexture();
+  const markerSize = Math.max(radius * 0.05, 0.1);
   const keyPoints: THREE.Vector3[] = [];
   for (let i = 0; i < frames; i += 1) {
     const t = i / frames;
@@ -151,15 +180,44 @@ function buildCameraPath(frames: number): {
   );
   path.add(line);
 
-  const markerMaterial = new THREE.MeshBasicMaterial({
+  const coneGeometry = new THREE.ConeGeometry(
+    markerSize * 0.5,
+    markerSize * 1.3,
+    5,
+  );
+  const coneMaterial = new THREE.MeshBasicMaterial({
+    color: GOLD,
+    transparent: true,
+    opacity: 0.92,
+  });
+  const markerSpriteMaterial = new THREE.SpriteMaterial({
+    map: circleTexture,
     color: "#9FE8DE",
     transparent: true,
-    opacity: 0.85,
+    opacity: 0.9,
+    depthTest: false,
+    depthWrite: false,
+    sizeAttenuation: false,
   });
-  const markerGeometry = new THREE.BoxGeometry(0.13, 0.13, 0.2);
+  const markers: THREE.Sprite[] = [];
+  const up = new THREE.Vector3(0, 1, 0);
+  const orientation = new THREE.Quaternion();
   for (const point of keyPoints) {
-    const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+    const cone = new THREE.Mesh(coneGeometry, coneMaterial);
+    cone.position.copy(point);
+    const previous = keyPoints[(keyPoints.indexOf(point) + frames - 1) % frames];
+    const next = keyPoints[(keyPoints.indexOf(point) + 1) % frames];
+    const forward = next
+      .clone()
+      .sub(previous)
+      .normalize();
+    orientation.setFromUnitVectors(up, forward);
+    cone.quaternion.copy(orientation);
+    path.add(cone);
+    const marker = new THREE.Sprite(markerSpriteMaterial);
     marker.position.copy(point);
+    marker.scale.set(22, 22, 1);
+    markers.push(marker);
     path.add(marker);
   }
 
@@ -170,10 +228,10 @@ function buildCameraPath(frames: number): {
   scanner.visible = false;
   path.add(scanner);
 
-  return { path, curve, scanner };
+  return { path, curve, scanner, markers };
 }
 
-function buildTitanPoints(entries: number[][]): THREE.Points {
+function buildTitanPoints(entries: number[][], radius: number): THREE.Points {
   const positions = new Float32Array(entries.length * 3);
   const colors = new Float32Array(entries.length * 3);
   const teal = new THREE.Color(ACCENT);
@@ -205,7 +263,7 @@ function buildTitanPoints(entries: number[][]): THREE.Points {
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
   const material = new THREE.PointsMaterial({
-    size: 0.05,
+    size: Math.max(radius * 0.018, 0.03),
     vertexColors: true,
     transparent: true,
     opacity: 0.94,
@@ -214,10 +272,14 @@ function buildTitanPoints(entries: number[][]): THREE.Points {
   return new THREE.Points(geometry, material);
 }
 
-function buildTitanCameraPath(cameras: TitanCamera[]): {
+function buildTitanCameraPath(
+  cameras: TitanCamera[],
+  radius: number,
+): {
   path: THREE.Group;
   curve: THREE.CatmullRomCurve3;
   scanner: THREE.Mesh;
+  markers: THREE.Sprite[];
 } {
   const keyPoints = cameras
     .slice()
@@ -237,15 +299,45 @@ function buildTitanCameraPath(cameras: TitanCamera[]): {
   );
   path.add(line);
 
-  const markerMaterial = new THREE.MeshBasicMaterial({
+  const circleTexture = makeCircleTexture();
+  const markerSize = Math.max(radius * 0.05, 0.1);
+  const coneGeometry = new THREE.ConeGeometry(
+    markerSize * 0.5,
+    markerSize * 1.3,
+    5,
+  );
+  const coneMaterial = new THREE.MeshBasicMaterial({
+    color: GOLD,
+    transparent: true,
+    opacity: 0.92,
+  });
+  const markerSpriteMaterial = new THREE.SpriteMaterial({
+    map: circleTexture,
     color: "#9FE8DE",
     transparent: true,
-    opacity: 0.85,
+    opacity: 0.9,
+    depthTest: false,
+    depthWrite: false,
+    sizeAttenuation: false,
   });
-  const markerGeometry = new THREE.BoxGeometry(0.12, 0.12, 0.2);
+  const markers: THREE.Sprite[] = [];
+  const up = new THREE.Vector3(0, 1, 0);
+  const orientation = new THREE.Quaternion();
   for (const point of keyPoints) {
-    const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+    const cone = new THREE.Mesh(coneGeometry, coneMaterial);
+    cone.position.copy(point);
+    const forward = new THREE.Vector3(
+      cameras[keyPoints.indexOf(point)].forward[0],
+      cameras[keyPoints.indexOf(point)].forward[1],
+      cameras[keyPoints.indexOf(point)].forward[2],
+    ).normalize();
+    orientation.setFromUnitVectors(up, forward);
+    cone.quaternion.copy(orientation);
+    path.add(cone);
+    const marker = new THREE.Sprite(markerSpriteMaterial);
     marker.position.copy(point);
+    marker.scale.set(22, 22, 1);
+    markers.push(marker);
     path.add(marker);
   }
 
@@ -262,12 +354,18 @@ function buildTitanCameraPath(cameras: TitanCamera[]): {
       : [new THREE.Vector3(0, 0, 0), new THREE.Vector3(1, 0, 0)];
   const closed = keyPoints.length > 2;
   const curve = new THREE.CatmullRomCurve3(curvePoints, closed, "centripetal", 0.5);
-  return { path, curve, scanner };
+  return { path, curve, scanner, markers };
 }
 
-function buildGround(): THREE.Group {
+function buildGround(radius: number): THREE.Group {
   const group = new THREE.Group();
-  const grid = new THREE.GridHelper(16, 18, ACCENT, "#5F6C73");
+  const gridSize = Math.max(radius * 3, 4);
+  const grid = new THREE.GridHelper(
+    gridSize,
+    Math.min(32, Math.max(12, Math.round(gridSize / 0.9))),
+    ACCENT,
+    "#5F6C73",
+  );
   const gridMaterials = Array.isArray(grid.material)
     ? grid.material
     : [grid.material];
@@ -278,7 +376,7 @@ function buildGround(): THREE.Group {
   group.add(grid);
 
   const ring = new THREE.Mesh(
-    new THREE.RingGeometry(2.75, 2.9, 72),
+    new THREE.RingGeometry(radius * 0.58, radius * 0.61, 72),
     new THREE.MeshBasicMaterial({
       color: ACCENT,
       transparent: true,
@@ -287,17 +385,25 @@ function buildGround(): THREE.Group {
     }),
   );
   ring.rotation.x = -Math.PI / 2;
-  ring.position.y = -2.35;
+  ring.position.y = -radius * 0.48;
   group.add(ring);
   return group;
 }
 
 export function createDemoScene(): SceneBundle {
   const group = new THREE.Group();
-  const points = buildPointCloud(48_000);
+  const sceneCenter = new THREE.Vector3(0, 0.25, 0);
+  const sceneRadius = 5.2;
+  const points = buildPointCloud(48_000, sceneRadius);
   const mesh = buildMesh();
-  const { path: cameraPath, curve, scanner } = buildCameraPath(24);
-  const ground = buildGround();
+  const {
+    path: cameraPath,
+    curve,
+    scanner,
+    markers,
+  } = buildCameraPath(24, sceneRadius);
+  const ground = buildGround(sceneRadius);
+  ground.position.y = sceneCenter.y - sceneRadius;
   const selection = new THREE.Mesh(
     new THREE.SphereGeometry(0.17, 18, 18),
     new THREE.MeshBasicMaterial({
@@ -310,14 +416,18 @@ export function createDemoScene(): SceneBundle {
 
   group.add(points, mesh, cameraPath, ground, selection);
 
+  let viewCamera: THREE.PerspectiveCamera | null = null;
   const demo: SceneBundle = {
     group,
     points,
     mesh,
     cameraPath,
+    markers,
     selection,
     pointCount: points.geometry.attributes.position.count,
     cameraCount: 24,
+    sceneCenter,
+    sceneRadius,
     setMode(mode) {
       points.visible = mode === "points";
       mesh.visible = mode === "mesh";
@@ -325,9 +435,16 @@ export function createDemoScene(): SceneBundle {
       scanner.visible = mode === "camera";
       selection.visible = false;
     },
+    setViewCamera(camera) {
+      viewCamera = camera;
+    },
     update(elapsed) {
       if (cameraPath.visible) {
         scanner.position.copy(curve.getPointAt((elapsed * 0.06) % 1));
+      }
+      const currentViewCamera = viewCamera;
+      if (currentViewCamera) {
+        markers.forEach((marker) => marker.lookAt(currentViewCamera.position));
       }
       if (selection.visible) {
         const pulse = 1 + 0.14 * Math.sin(elapsed * 5);
@@ -342,10 +459,44 @@ export function createDemoScene(): SceneBundle {
 
 export function createTitanScene(data: TitanSceneData): SceneBundle {
   const group = new THREE.Group();
-  const points = buildTitanPoints(data.points);
+  const sceneCenter = new THREE.Vector3();
+  let sceneRadius = 1;
+  if (data.points.length > 0) {
+    const box = new THREE.Box3();
+    data.points.forEach((point) => {
+      box.expandByPoint(new THREE.Vector3(point[0], point[1], point[2]));
+    });
+    box.getCenter(sceneCenter);
+    const size = box.getSize(new THREE.Vector3());
+    sceneRadius = Math.max(size.x, size.y, size.z) / 2;
+  }
+  if (data.cameras.length > 0) {
+    const cameraBox = new THREE.Box3();
+    data.cameras.forEach((camera) => {
+      cameraBox.expandByPoint(
+        new THREE.Vector3(
+          camera.position[0],
+          camera.position[1],
+          camera.position[2],
+        ),
+      );
+    });
+    const center = cameraBox.getCenter(new THREE.Vector3());
+    const size = cameraBox.getSize(new THREE.Vector3());
+    sceneCenter.addVectors(sceneCenter, center).multiplyScalar(0.5);
+    sceneRadius = Math.max(sceneRadius, Math.max(size.x, size.y, size.z) / 2);
+  }
+  if (sceneRadius < 1e-3) sceneRadius = 1;
+  const points = buildTitanPoints(data.points, sceneRadius);
   const mesh = new THREE.Group();
-  const { path: cameraPath, curve, scanner } = buildTitanCameraPath(data.cameras);
-  const ground = buildGround();
+  const {
+    path: cameraPath,
+    curve,
+    scanner,
+    markers,
+  } = buildTitanCameraPath(data.cameras, sceneRadius);
+  const ground = buildGround(sceneRadius);
+  ground.position.y = sceneCenter.y - sceneRadius;
   const selection = new THREE.Mesh(
     new THREE.SphereGeometry(0.17, 18, 18),
     new THREE.MeshBasicMaterial({
@@ -358,14 +509,18 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
 
   group.add(points, mesh, cameraPath, ground, selection);
 
+  let viewCamera: THREE.PerspectiveCamera | null = null;
   const scene: SceneBundle = {
     group,
     points,
     mesh,
     cameraPath,
+    markers,
     selection,
     pointCount: data.points.length,
     cameraCount: data.cameras.length,
+    sceneCenter,
+    sceneRadius,
     setMode(mode) {
       points.visible = mode === "points";
       mesh.visible = mode === "mesh";
@@ -373,9 +528,16 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
       scanner.visible = mode === "camera";
       selection.visible = false;
     },
+    setViewCamera(camera) {
+      viewCamera = camera;
+    },
     update(elapsed) {
       if (cameraPath.visible && data.cameras.length > 1) {
         scanner.position.copy(curve.getPointAt((elapsed * 0.05) % 1));
+      }
+      const currentViewCamera = viewCamera;
+      if (currentViewCamera) {
+        markers.forEach((marker) => marker.lookAt(currentViewCamera.position));
       }
       if (selection.visible) {
         const pulse = 1 + 0.14 * Math.sin(elapsed * 5);

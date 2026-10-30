@@ -1,18 +1,37 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
   Boxes,
   Camera,
+  ChevronLeft,
+  ChevronRight,
   Download,
+  Focus,
   Grid3x3,
   LoaderCircle,
   type LucideIcon,
 } from "lucide-react";
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
-import { SceneCanvas, type SceneStats } from "../components/SceneCanvas";
+import {
+  SceneCanvas,
+  type SceneCanvasHandle,
+  type SceneStats,
+} from "../components/SceneCanvas";
 import { StatusPill } from "../components/StatusPill";
 import type { SceneMode, TitanSceneData } from "../lib/demoScene";
+
+type RenderFilter = "all" | "train" | "eval" | "novel";
+type RenderItem = { name: string; path: string; view: string };
+
+const RENDER_PAGE_SIZE = 18;
+
+const RENDER_FILTERS: { value: RenderFilter; label: string }[] = [
+  { value: "all", label: "全部" },
+  { value: "train", label: "训练" },
+  { value: "eval", label: "留出" },
+  { value: "novel", label: "新视角" },
+];
 
 const MODES: {
   value: SceneMode;
@@ -48,7 +67,10 @@ function viewLabel(view: string | undefined) {
 export function Scene() {
   const [searchParams] = useSearchParams();
   const projectId = searchParams.get("project") ?? "";
+  const canvasRef = useRef<SceneCanvasHandle | null>(null);
   const [mode, setMode] = useState<SceneMode>("points");
+  const [renderFilter, setRenderFilter] = useState<RenderFilter>("all");
+  const [renderPage, setRenderPage] = useState(0);
   const [stats, setStats] = useState<SceneStats>({
     pointCount: 0,
     cameraCount: 0,
@@ -90,16 +112,20 @@ export function Scene() {
     if (scene && mode === "mesh") setMode("points");
   }, [scene, mode]);
 
+  useEffect(() => {
+    setRenderPage(0);
+  }, [renderFilter, scene]);
+
   const config = scene?.config ?? null;
   const configRows = config
     ? [
         {
           label: "分辨率",
-          value: `${configNumber(config.resolution, 256)} px`,
+          value: `${configNumber(config.resolution, 192)} px`,
         },
         {
           label: "训练步数",
-          value: `${configNumber(config.steps, 600)} 步`,
+          value: `${configNumber(config.steps, 1200)} 步`,
         },
         {
           label: "训练视角",
@@ -107,7 +133,7 @@ export function Scene() {
         },
         {
           label: "Patch 采样",
-          value: `${configNumber(config.patch_size, 2048)} px`,
+          value: `${configNumber(config.patch_size, 1024)} px`,
         },
         {
           label: "显存预算",
@@ -153,7 +179,28 @@ export function Scene() {
         { name: "渲染导出", label: "等待", tone: "neutral" as const },
       ];
 
-  const renders = scene?.renders ?? [];
+  const renderItems: RenderItem[] = [
+    ...(scene?.renders ?? []).map((render) => ({
+      name: render.name,
+      path: render.path,
+      view: render.view,
+    })),
+    ...(scene?.novelView
+      ? [{ name: "新视角", path: scene.novelView, view: "novel" as const }]
+      : []),
+  ];
+  const filteredRenders = renderItems.filter(
+    (render) => renderFilter === "all" || render.view === renderFilter,
+  );
+  const renderPageCount = Math.max(
+    1,
+    Math.ceil(filteredRenders.length / RENDER_PAGE_SIZE),
+  );
+  const clampedRenderPage = Math.min(renderPage, renderPageCount - 1);
+  const pageRenders = filteredRenders.slice(
+    clampedRenderPage * RENDER_PAGE_SIZE,
+    (clampedRenderPage + 1) * RENDER_PAGE_SIZE,
+  );
   const projectBase = (scene?.projectDir ?? "").replace(/\\/g, "/");
   const renderSrc = (path: string) => convertFileSrc(`${projectBase}/${path}`);
 
@@ -189,6 +236,15 @@ export function Scene() {
           <button
             className="icon-btn"
             type="button"
+            onClick={() => canvasRef.current?.resetView()}
+            title="聚焦场景"
+            aria-label="聚焦场景"
+          >
+            <Focus size={16} />
+          </button>
+          <button
+            className="icon-btn"
+            type="button"
             title="导出渲染"
             aria-label="导出渲染"
             disabled
@@ -220,7 +276,12 @@ export function Scene() {
         </section>
 
         <section className="scene-stage" aria-label="三维重建场景">
-          <SceneCanvas mode={mode} onStats={handleStats} scene={scene} />
+          <SceneCanvas
+            ref={canvasRef}
+            mode={mode}
+            onStats={handleStats}
+            scene={scene}
+          />
           {sceneLoading && (
             <div className="scene-loading">
               <LoaderCircle className="spin" size={18} />
@@ -284,44 +345,86 @@ export function Scene() {
             </div>
           </section>
 
-          {scene && renders.length > 0 && (
-            <section className="panel scene-panel">
+          {scene && renderItems.length > 0 && (
+            <section className="panel scene-panel scene-panel--render">
               <div className="panel__header">
                 <h2 className="panel__title">渲染</h2>
-                <StatusPill tone="accent" label={`${renders.length} 张`} />
+                <StatusPill tone="accent" label={`${filteredRenders.length} 张`} />
+              </div>
+              <div className="render-toolbar">
+                <div
+                  className="segmented render-filter"
+                  role="group"
+                  aria-label="渲染分类"
+                >
+                  {RENDER_FILTERS.map(({ value, label }) => (
+                    <button
+                      key={value}
+                      type="button"
+                      aria-pressed={renderFilter === value}
+                      onClick={() => setRenderFilter(value)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
               </div>
               <div className="panel__body render-list">
-                {renders.map((render, index) => (
-                  <figure className="render-thumb" key={`${render.name}-${index}`}>
-                    <div className="render-thumb__frame">
-                      <img
-                        src={renderSrc(render.path)}
-                        alt={render.name}
-                        loading="lazy"
-                      />
-                    </div>
-                    <figcaption className="render-thumb__meta">
-                      <strong>{viewLabel(render.view)}</strong>
-                      <span className="mono">{String(index + 1).padStart(2, "0")}</span>
-                    </figcaption>
-                  </figure>
-                ))}
-                {scene.novelView && (
-                  <figure className="render-thumb render-thumb--novel">
-                    <div className="render-thumb__frame">
-                      <img
-                        src={renderSrc(scene.novelView)}
-                        alt="新视角渲染"
-                        loading="lazy"
-                      />
-                    </div>
-                    <figcaption className="render-thumb__meta">
-                      <strong>新视角</strong>
-                      <span className="mono">00</span>
-                    </figcaption>
-                  </figure>
+                {pageRenders.map((render, index) => {
+                  const absoluteIndex =
+                    clampedRenderPage * RENDER_PAGE_SIZE + index + 1;
+                  return (
+                    <figure
+                      className={`render-thumb${render.view === "novel" ? " render-thumb--novel" : ""}`}
+                      key={`${render.view}-${render.name}-${absoluteIndex}`}
+                    >
+                      <div className="render-thumb__frame">
+                        <img
+                          src={renderSrc(render.path)}
+                          alt={render.name}
+                          loading="lazy"
+                        />
+                      </div>
+                      <figcaption className="render-thumb__meta">
+                        <strong>{viewLabel(render.view)}</strong>
+                        <span className="mono">
+                          {String(absoluteIndex).padStart(2, "0")}
+                        </span>
+                      </figcaption>
+                    </figure>
+                  );
+                })}
+                {pageRenders.length === 0 && (
+                  <div className="render-empty">当前分类暂无渲染</div>
                 )}
               </div>
+              {renderPageCount > 1 && (
+                <div className="render-pager">
+                  <button
+                    className="icon-btn"
+                    type="button"
+                    onClick={() => setRenderPage(clampedRenderPage - 1)}
+                    disabled={clampedRenderPage === 0}
+                    title="上一页"
+                    aria-label="上一页"
+                  >
+                    <ChevronLeft size={16} />
+                  </button>
+                  <span className="render-pager__info mono">
+                    第 {clampedRenderPage + 1} / {renderPageCount} 页
+                  </span>
+                  <button
+                    className="icon-btn"
+                    type="button"
+                    onClick={() => setRenderPage(clampedRenderPage + 1)}
+                    disabled={clampedRenderPage >= renderPageCount - 1}
+                    title="下一页"
+                    aria-label="下一页"
+                  >
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+              )}
             </section>
           )}
         </div>

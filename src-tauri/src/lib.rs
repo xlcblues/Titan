@@ -777,13 +777,22 @@ fn start_reconstruction(
 
     let mut merged = json!({
         "engine": "facets",
-        "resolution": 256,
-        "steps": 600,
+        "resolution": 192,
+        "steps": 1200,
         "train_views": 16,
-        "patch_size": 2048,
-        "eval_every": 50,
+        "patch_size": 1024,
+        "eval_every": 100,
         "learning_rate": 0.02,
-        "gpu_budget": 8
+        "gpu_budget": 8,
+        "render_batch_size": 256,
+        "max_splats": 12000,
+        "global_residual_resolution": 16,
+        "global_residual_weight": 0.6,
+        "init_target_px": 1.3,
+        "sparse_points_limit": 12000,
+        "background_residual_weight": 0.0,
+        "disk_cutoff": 1.8,
+        "falloff_power": 1.0
     });
     if let Some(user_config) = config {
         if let Some(object) = user_config.as_object() {

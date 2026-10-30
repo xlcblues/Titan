@@ -83,7 +83,12 @@ def render_rays(
     return rendered
 
 
-def render_view(model, camera: dict, background: np.ndarray):
+def render_view(
+    model,
+    camera: dict,
+    background: np.ndarray,
+    scene_points: np.ndarray | None = None,
+):
     device = next(model.parameters()).device
     c2w = np.asarray(camera["c2w"], dtype=np.float32)
     k = camera["K"]
@@ -95,10 +100,17 @@ def render_view(model, camera: dict, background: np.ndarray):
     local = np.stack([(xs - cx) / fx, (ys - cy) / fy, np.ones_like(xs)], axis=-1)
     directions = local @ rotation.T
     directions = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
+    near, far = (
+        ray_bounds_from_points(origin, scene_points)
+        if scene_points is not None and len(scene_points)
+        else (2.4, 7.6)
+    )
     rendered = render_rays(
         model,
         origin,
         directions.reshape(-1, 3),
+        near=near,
+        far=far,
         background=background,
     )
     return rendered.reshape(height, width, 3)
@@ -143,6 +155,7 @@ def train_tfrf_torch(
         compute_metrics,
         emit_status,
         log,
+        ray_bounds_from_points,
         status_after,
     )
 
@@ -160,6 +173,11 @@ def train_tfrf_torch(
         np.asarray(sparse_points, dtype=np.float32)[:, :3]
         if sparse_points
         else None
+    )
+    scene_points = (
+        np.asarray(sparse_points, dtype=np.float32)[:, :3]
+        if sparse_points
+        else np.empty((0, 3), dtype=np.float32)
     )
 
     train_cameras = cameras[:train_count]
@@ -203,10 +221,13 @@ def train_tfrf_torch(
             directions, axis=-1, keepdims=True
         )
 
+        near, far = ray_bounds_from_points(origin, scene_points)
         rendered = render_rays(
             model,
             origin,
             directions,
+            near=near,
+            far=far,
             samples=sample_count,
             background=background,
         )
@@ -230,7 +251,9 @@ def train_tfrf_torch(
             eval_index = (step // eval_every) % len(eval_cameras)
             eval_camera = eval_cameras[eval_index]
             with torch.no_grad():
-                rendered_view = render_view(model, eval_camera, background)
+                rendered_view = render_view(
+                    model, eval_camera, background, scene_points=scene_points
+                )
             target_view = images[len(cameras) - len(eval_cameras) + eval_index]
             metrics = compute_metrics(
                 rendered_view.cpu().numpy(), target_view

@@ -648,16 +648,29 @@
   gap: 16px;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.scene-side > .scene-panel {
+  flex: 0 0 auto;
 }
 
 .scene-panel--render {
-  flex: 1 1 0;
-  min-height: 0;
+  order: -1;
+  flex: 0 0 auto;
+  min-height: 260px;
+  max-height: min(46vh, 420px);
 }
 
 .scene-panel--render .panel__body {
   min-height: 0;
+}
+
+.scene-panel--render .panel__header,
+.scene-panel--render .render-toolbar,
+.scene-panel--render .render-pager {
+  flex-shrink: 0;
 }
 
 .metric-list {

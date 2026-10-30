@@ -238,6 +238,15 @@ function buildTitanPoints(entries: number[][], radius: number): THREE.Points {
   const gold = new THREE.Color(GOLD);
   const tmp = new THREE.Color();
 
+  let minPointRadius = Infinity;
+  let maxPointRadius = -Infinity;
+  for (const entry of entries) {
+    const pointRadius = Math.hypot(entry[0], entry[1], entry[2]);
+    minPointRadius = Math.min(minPointRadius, pointRadius);
+    maxPointRadius = Math.max(maxPointRadius, pointRadius);
+  }
+  const pointRadiusSpan = maxPointRadius - minPointRadius;
+
   entries.forEach((entry, index) => {
     positions[index * 3] = entry[0];
     positions[index * 3 + 1] = entry[1];
@@ -245,13 +254,22 @@ function buildTitanPoints(entries: number[][], radius: number): THREE.Points {
     const r = entry[3];
     const g = entry[4];
     const b = entry[5];
-    if (r != null && g != null && b != null) {
+    const hasColor = r != null && g != null && b != null;
+    const channelSum = hasColor ? r + g + b : 0;
+    if (hasColor && channelSum >= 18) {
       colors[index * 3] = r / 255;
       colors[index * 3 + 1] = g / 255;
       colors[index * 3 + 2] = b / 255;
     } else {
-      const radius = Math.hypot(entry[0], entry[1], entry[2]);
-      const t = THREE.MathUtils.clamp((radius - 1.65) / 1.15, 0, 1);
+      const pointRadius = Math.hypot(entry[0], entry[1], entry[2]);
+      const t =
+        pointRadiusSpan > 1e-6
+          ? THREE.MathUtils.clamp(
+              (pointRadius - minPointRadius) / pointRadiusSpan,
+              0,
+              1,
+            )
+          : 0.5;
       tmp.copy(teal).lerp(gold, t);
       colors[index * 3] = tmp.r;
       colors[index * 3 + 1] = tmp.g;
@@ -263,10 +281,10 @@ function buildTitanPoints(entries: number[][], radius: number): THREE.Points {
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
   const material = new THREE.PointsMaterial({
-    size: Math.max(radius * 0.018, 0.03),
+    size: Math.max(radius * 0.022, 0.08),
     vertexColors: true,
     transparent: true,
-    opacity: 0.94,
+    opacity: 0.96,
     sizeAttenuation: true,
   });
   return new THREE.Points(geometry, material);
@@ -461,6 +479,7 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
   const group = new THREE.Group();
   const sceneCenter = new THREE.Vector3();
   let sceneRadius = 1;
+  let pointRadius = 1;
   if (data.points.length > 0) {
     const box = new THREE.Box3();
     data.points.forEach((point) => {
@@ -468,7 +487,8 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
     });
     box.getCenter(sceneCenter);
     const size = box.getSize(new THREE.Vector3());
-    sceneRadius = Math.max(size.x, size.y, size.z) / 2;
+    pointRadius = Math.max(size.x, size.y, size.z) / 2;
+    sceneRadius = pointRadius;
   }
   if (data.cameras.length > 0) {
     const cameraBox = new THREE.Box3();
@@ -487,7 +507,7 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
     sceneRadius = Math.max(sceneRadius, Math.max(size.x, size.y, size.z) / 2);
   }
   if (sceneRadius < 1e-3) sceneRadius = 1;
-  const points = buildTitanPoints(data.points, sceneRadius);
+  const points = buildTitanPoints(data.points, Math.max(pointRadius, 1e-3));
   const mesh = new THREE.Group();
   const {
     path: cameraPath,

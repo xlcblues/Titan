@@ -100,7 +100,7 @@ async function main() {
         overlapsStage: overlap
       };
       if (canvas) {
-        const gl = canvas.getContext('webgl') || canvas.getContext('webgl2');
+        const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
         if (gl) {
           const width = gl.drawingBufferWidth;
           const height = gl.drawingBufferHeight;

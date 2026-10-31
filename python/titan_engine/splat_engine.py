@@ -179,7 +179,33 @@ def _project_points(
     return camera_space, u, v, z, visible
 
 
-def _render_pixels(
+def _accumulate_alpha(
+    alphas: torch.Tensor,
+    colors: torch.Tensor,
+    transmittance: torch.Tensor,
+    accumulated: torch.Tensor,
+):
+    """Depth-ordered alpha compositing with per-splat transmittance decay.
+
+    alphas has shape (chunk, pixels) and is ordered near-to-far. Without the
+    intra-chunk cumulative product, splats inside one chunk would all use the
+    same transmittance, which brightens and fogs dense scenes.
+    """
+    survive = torch.cumprod(1.0 - alphas, dim=0)
+    before = torch.ones_like(alphas)
+    before[1:] = survive[:-1]
+    per_splat_transmittance = transmittance[None, :] * before
+    contribution = (
+        alphas[:, :, None]
+        * colors[:, None, :]
+        * per_splat_transmittance[:, :, None]
+    )
+    accumulated = accumulated + contribution.sum(dim=0)
+    transmittance = transmittance * survive[-1]
+    return accumulated, transmittance
+
+
+def _render_pixels_dense(
     model: SplatFacetField,
     camera: dict,
     pixels: torch.Tensor | None,
@@ -294,12 +320,343 @@ def _render_pixels(
         weight = weight * (squared < 0.5 * disk_cutoff * disk_cutoff)
         alpha = opacity[chunk, None] * weight
         alpha = torch.clamp(alpha, 0.0, 1.0)
-        contribution = alpha[:, :, None] * color[chunk][:, None, :] * transmittance[None, :, None]
-        accumulated = accumulated + contribution.sum(dim=0)
-        transmittance = transmittance * torch.prod(1.0 - alpha, dim=0)
+        accumulated, transmittance = _accumulate_alpha(
+            alpha, color[chunk], transmittance, accumulated
+        )
 
     rendered = accumulated + transmittance[:, None] * background[None, :]
     return rendered.reshape(output_shape)
+
+
+def _render_pixels_tile(
+    model: SplatFacetField,
+    camera: dict,
+    pixels: torch.Tensor | None,
+    width: int,
+    height: int,
+    background: torch.Tensor,
+    near: float | None = None,
+    far: float | None = None,
+    scene_points: np.ndarray | None = None,
+    batch_size: int = 256,
+    disk_cutoff: float = 2.2,
+    falloff_power: float = 1.0,
+    tile_size: int = 16,
+):
+    """Tile rasterizer that only composites splats overlapping each tile."""
+    device = next(model.parameters()).device
+    tile_size = max(1, int(tile_size))
+    rotation, origin, fx, fy, cx, cy, width, height = _camera_geometry(
+        camera, device
+    )
+    positions, scale, opacity, color = model()
+    if near is None or far is None:
+        if scene_points is not None and len(scene_points) > 0:
+            from .main import ray_bounds_from_points
+
+            bounds = ray_bounds_from_points(
+                origin.cpu().detach().numpy(), scene_points
+            )
+        else:
+            depths = torch.linalg.norm(
+                positions - origin[None, :].to(device), dim=1
+            )
+            if depths.numel() == 0:
+                bounds = (0.3, 7.6)
+            else:
+                lower = float(
+                    torch.quantile(depths.detach(), 0.05).item()
+                )
+                upper = float(
+                    torch.quantile(depths.detach(), 0.95).item()
+                )
+                bounds = (
+                    max(lower * 0.75, 1e-4),
+                    max(upper * 1.35, lower * 1.5 + 1e-4),
+                )
+        if near is None:
+            near = bounds[0]
+        if far is None:
+            far = bounds[1]
+    camera_space, u, v, z, visible = _project_points(
+        positions,
+        rotation,
+        origin,
+        fx,
+        fy,
+        cx,
+        cy,
+        width,
+        height,
+        near,
+    )
+    if far is not None:
+        visible = visible & (z < far)
+
+    if pixels is None:
+        uu, vv = torch.meshgrid(
+            torch.arange(width, dtype=torch.float32, device=device),
+            torch.arange(height, dtype=torch.float32, device=device),
+            indexing="xy",
+        )
+        pixels = torch.stack([uu.reshape(-1), vv.reshape(-1)], dim=1)
+        pixel_count = pixels.shape[0]
+        output_shape = (height, width, 3)
+    else:
+        pixels = pixels.to(device)
+        pixel_count = pixels.shape[0]
+        output_shape = (pixel_count, 3)
+
+    sigma_u = scale[:, None] * fx / torch.clamp(z, min=1e-4)
+    sigma_v = scale[:, None] * fy / torch.clamp(z, min=1e-4)
+    radius_u = 2.8 * sigma_u[:, 0]
+    radius_v = 2.8 * sigma_v[:, 0]
+    margin = 4.0
+    active = (
+        visible[:, 0]
+        & (u[:, 0] > -radius_u - margin)
+        & (u[:, 0] < width + radius_u + margin)
+        & (v[:, 0] > -radius_v - margin)
+        & (v[:, 0] < height + radius_v + margin)
+    )
+    active_indices = torch.nonzero(active).reshape(-1)
+    if active_indices.numel() == 0:
+        rendered = background[None, :].expand(pixel_count, -1)
+        return rendered.reshape(output_shape)
+
+    tiles_x = math.ceil(width / tile_size)
+    tiles_y = math.ceil(height / tile_size)
+
+    min_u = u[:, 0] - radius_u - margin
+    max_u = u[:, 0] + radius_u + margin
+    min_v = v[:, 0] - radius_v - margin
+    max_v = v[:, 0] + radius_v + margin
+    min_tile_u = torch.clamp(
+        torch.floor(min_u / tile_size).long(), 0, tiles_x - 1
+    )
+    max_tile_u = torch.clamp(
+        torch.floor(max_u / tile_size).long(), 0, tiles_x - 1
+    )
+    min_tile_v = torch.clamp(
+        torch.floor(min_v / tile_size).long(), 0, tiles_y - 1
+    )
+    max_tile_v = torch.clamp(
+        torch.floor(max_v / tile_size).long(), 0, tiles_y - 1
+    )
+
+    pixel_tile_u = torch.clamp(
+        torch.floor(pixels[:, 0] / tile_size).long(), 0, tiles_x - 1
+    )
+    pixel_tile_v = torch.clamp(
+        torch.floor(pixels[:, 1] / tile_size).long(), 0, tiles_y - 1
+    )
+    pixel_keys = pixel_tile_u + tiles_x * pixel_tile_v
+    pixel_order = torch.argsort(pixel_keys)
+    sorted_pixels = pixels[pixel_order]
+    sorted_keys = pixel_keys[pixel_order]
+    pixel_unique, pixel_counts = torch.unique_consecutive(
+        sorted_keys, return_counts=True
+    )
+    pixel_starts = torch.cumsum(pixel_counts, 0) - pixel_counts
+
+    a_min_u = min_tile_u[active_indices]
+    a_max_u = max_tile_u[active_indices]
+    a_min_v = min_tile_v[active_indices]
+    a_max_v = max_tile_v[active_indices]
+    span_u = a_max_u - a_min_u + 1
+    span_v = a_max_v - a_min_v + 1
+    products = span_u * span_v
+    max_expand = max(
+        1,
+        min(
+            4096,
+            2_000_000 // max(int(active_indices.numel()), 1),
+        ),
+    )
+    broad = products > max_expand
+    broad_idx = active_indices[broad]
+    small_mask = ~broad
+    small_products = products[small_mask]
+    small_idx = active_indices[small_mask]
+
+    if small_idx.numel() > 0:
+        small_span_u = span_u[small_mask]
+        small_min_u = a_min_u[small_mask]
+        small_min_v = a_min_v[small_mask]
+        total_entries = int(small_products.sum().item())
+        group_ids = torch.repeat_interleave(
+            torch.arange(small_idx.numel(), device=device),
+            small_products,
+        )
+        local = torch.arange(total_entries, device=device) - torch.repeat_interleave(
+            torch.cumsum(small_products, 0) - small_products,
+            small_products,
+        )
+        repeated_span = small_span_u[group_ids]
+        entry_tile_u = small_min_u[group_ids] + local % repeated_span
+        entry_tile_v = small_min_v[group_ids] + local // repeated_span
+        entry_keys = entry_tile_u + tiles_x * entry_tile_v
+        entry_splats = small_idx[group_ids]
+        entry_order = torch.argsort(entry_keys)
+        entry_keys = entry_keys[entry_order]
+        entry_splats = entry_splats[entry_order]
+    else:
+        entry_keys = torch.empty(0, dtype=torch.long, device=device)
+        entry_splats = torch.empty(0, dtype=torch.long, device=device)
+
+    if broad_idx.numel() > 0:
+        broad_min_u = min_tile_u[broad_idx]
+        broad_max_u = max_tile_u[broad_idx]
+        broad_min_v = min_tile_v[broad_idx]
+        broad_max_v = max_tile_v[broad_idx]
+    else:
+        broad_min_u = broad_max_u = broad_min_v = broad_max_v = None
+
+    entry_start = torch.searchsorted(entry_keys, pixel_unique)
+    entry_end = torch.searchsorted(entry_keys, pixel_unique + 1)
+    output = torch.zeros(
+        (pixel_count, 3), dtype=torch.float32, device=device
+    )
+
+    for tile_index, tile_key in enumerate(pixel_unique.tolist()):
+        tile_u = tile_key % tiles_x
+        tile_v = tile_key // tiles_x
+        ps_start = int(pixel_starts[tile_index].item())
+        ps_end = int(pixel_starts[tile_index].item() + pixel_counts[tile_index].item())
+        es_start = int(entry_start[tile_index].item())
+        es_end = int(entry_end[tile_index].item())
+        tile_splats = entry_splats[es_start:es_end]
+        if broad_idx.numel() > 0:
+            broad_mask = (
+                (broad_min_u <= tile_u)
+                & (broad_max_u >= tile_u)
+                & (broad_min_v <= tile_v)
+                & (broad_max_v >= tile_v)
+            )
+            tile_splats = torch.cat(
+                [tile_splats, broad_idx[torch.nonzero(broad_mask).reshape(-1)]]
+            )
+        tile_pixels = sorted_pixels[ps_start:ps_end]
+        if tile_splats.numel() == 0:
+            output[pixel_order[ps_start:ps_end]] = (
+                background[None, :].expand(ps_end - ps_start, -1)
+            )
+            continue
+        order = tile_splats[
+            torch.argsort(z[tile_splats, 0])
+        ]
+        transmittance = torch.ones(
+            ps_end - ps_start, dtype=torch.float32, device=device
+        )
+        accumulated = torch.zeros(
+            (ps_end - ps_start, 3), dtype=torch.float32, device=device
+        )
+        for start in range(0, order.numel(), batch_size):
+            chunk = order[start : start + batch_size]
+            du = tile_pixels[:, 0][None, :] - u[chunk, 0][:, None]
+            dv = tile_pixels[:, 1][None, :] - v[chunk, 0][:, None]
+            squared = (
+                du * du
+                / (
+                    2.0
+                    * sigma_u[chunk, 0][:, None]
+                    * sigma_u[chunk, 0][:, None]
+                )
+                + dv
+                * dv
+                / (
+                    2.0
+                    * sigma_v[chunk, 0][:, None]
+                    * sigma_v[chunk, 0][:, None]
+                )
+            )
+            if falloff_power == 1.0:
+                weight = torch.exp(-squared)
+            else:
+                weight = torch.exp(-torch.pow(squared, falloff_power))
+            weight = weight * (squared < 0.5 * disk_cutoff * disk_cutoff)
+            alpha = torch.clamp(opacity[chunk, None] * weight, 0.0, 1.0)
+            accumulated, transmittance = _accumulate_alpha(
+                alpha, color[chunk], transmittance, accumulated
+            )
+        rendered = accumulated + transmittance[:, None] * background[None, :]
+        output[pixel_order[ps_start:ps_end]] = rendered
+
+    return output.reshape(output_shape)
+
+
+def _render_pixels(
+    model: SplatFacetField,
+    camera: dict,
+    pixels: torch.Tensor | None,
+    width: int,
+    height: int,
+    background: torch.Tensor,
+    near: float | None = None,
+    far: float | None = None,
+    scene_points: np.ndarray | None = None,
+    batch_size: int = 96,
+    disk_cutoff: float = 2.2,
+    falloff_power: float = 1.0,
+    tile_size: int = 16,
+    dense_renderer: bool = False,
+    auto_dense_threshold: int = 20000,
+    auto_dense_pixels: int = 1_000_000,
+):
+    splat_count = int(model.positions.numel())
+    pixel_count = (
+        int(pixels.shape[0]) if pixels is not None else int(width) * int(height)
+    )
+    use_dense = dense_renderer or (
+        splat_count <= auto_dense_threshold
+        and pixel_count <= auto_dense_pixels
+    )
+    if use_dense:
+        return _render_pixels_dense(
+            model,
+            camera,
+            pixels,
+            width,
+            height,
+            background,
+            near=near,
+            far=far,
+            scene_points=scene_points,
+            batch_size=batch_size,
+            disk_cutoff=disk_cutoff,
+            falloff_power=falloff_power,
+        )
+    try:
+        return _render_pixels_tile(
+            model,
+            camera,
+            pixels,
+            width,
+            height,
+            background,
+            near=near,
+            far=far,
+            scene_points=scene_points,
+            batch_size=batch_size,
+            disk_cutoff=disk_cutoff,
+            falloff_power=falloff_power,
+            tile_size=tile_size,
+        )
+    except Exception:
+        return _render_pixels_dense(
+            model,
+            camera,
+            pixels,
+            width,
+            height,
+            background,
+            near=near,
+            far=far,
+            scene_points=scene_points,
+            batch_size=batch_size,
+            disk_cutoff=disk_cutoff,
+            falloff_power=falloff_power,
+        )
 
 
 def render_splats_view(
@@ -310,6 +667,10 @@ def render_splats_view(
     batch_size: int = 96,
     disk_cutoff: float = 2.2,
     falloff_power: float = 1.0,
+    tile_size: int = 16,
+    dense_renderer: bool = False,
+    auto_dense_threshold: int = 20000,
+    auto_dense_pixels: int = 1_000_000,
 ) -> np.ndarray:
     device = next(model.parameters()).device
     bg = torch.as_tensor(background, dtype=torch.float32, device=device)
@@ -325,6 +686,10 @@ def render_splats_view(
             batch_size=batch_size,
             disk_cutoff=disk_cutoff,
             falloff_power=falloff_power,
+            tile_size=tile_size,
+            dense_renderer=dense_renderer,
+            auto_dense_threshold=auto_dense_threshold,
+            auto_dense_pixels=auto_dense_pixels,
         )
     return image.cpu().detach().numpy()
 
@@ -596,6 +961,10 @@ def train_tfrf_splat(
     progress_every = int(config.get("progress_every", 10))
     learning_rate = float(config.get("learning_rate", 0.02))
     render_batch = int(config.get("render_batch_size", 256))
+    render_tile = max(1, int(config.get("render_tile_size", 16)))
+    dense_renderer = bool(config.get("dense_renderer", False))
+    auto_dense_threshold = int(config.get("auto_dense_threshold", 20000))
+    auto_dense_pixels = int(config.get("auto_dense_pixels", 1_000_000))
     disk_cutoff = float(config.get("disk_cutoff", 1.8))
     falloff_power = float(config.get("falloff_power", 1.0))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -732,6 +1101,10 @@ def train_tfrf_splat(
             batch_size=render_batch,
             disk_cutoff=disk_cutoff,
             falloff_power=falloff_power,
+            tile_size=render_tile,
+            dense_renderer=dense_renderer,
+            auto_dense_threshold=auto_dense_threshold,
+            auto_dense_pixels=auto_dense_pixels,
         )
         target = torch.as_tensor(
             images[int(camera_choices[step])][ys, xs],
@@ -790,6 +1163,10 @@ def train_tfrf_splat(
                 batch_size=render_batch,
                 disk_cutoff=disk_cutoff,
                 falloff_power=falloff_power,
+                tile_size=render_tile,
+                dense_renderer=dense_renderer,
+                auto_dense_threshold=auto_dense_threshold,
+                auto_dense_pixels=auto_dense_pixels,
             )
             low_target = torch.as_tensor(
                 images_low[int(camera_choices[step])].reshape(-1, 3),
@@ -821,6 +1198,10 @@ def train_tfrf_splat(
                 batch_size=render_batch,
                 disk_cutoff=disk_cutoff,
                 falloff_power=falloff_power,
+                tile_size=render_tile,
+                dense_renderer=dense_renderer,
+                auto_dense_threshold=auto_dense_threshold,
+                auto_dense_pixels=auto_dense_pixels,
             )
             bg_target = torch.as_tensor(
                 images[int(camera_choices[step])][bg_ys, bg_xs],
@@ -899,6 +1280,10 @@ def train_tfrf_splat(
                     batch_size=render_batch,
                     disk_cutoff=disk_cutoff,
                     falloff_power=falloff_power,
+                    tile_size=render_tile,
+                    dense_renderer=dense_renderer,
+                    auto_dense_threshold=auto_dense_threshold,
+                    auto_dense_pixels=auto_dense_pixels,
                 )
             target_view = images[len(cameras) - len(eval_cameras) + eval_index]
             metrics = compute_metrics(rendered_view, target_view)

@@ -186,7 +186,7 @@ def load_pose_data(
 
         sparse_dir = find_sparse_dir(image_paths)
         if sparse_dir:
-            point_limit = int(config.get("sparse_points_limit", 2400))
+            point_limit = int(config.get("sparse_points_limit", 50000))
             colmap_data = load_colmap_sparse(
                 sparse_dir, image_paths, point_limit=point_limit
             )
@@ -376,6 +376,9 @@ def load_and_prepare_images(
             [0.0, fy, cy],
             [0.0, 0.0, 1.0],
         ]
+        camera["source_width"] = actual_width
+        camera["source_height"] = actual_height
+        camera["source_K"] = source_k
     return np.stack(images, axis=0)
 
 
@@ -592,17 +595,38 @@ def render_view(
     scene_points: np.ndarray | None = None,
     disk_cutoff: float = 2.2,
     falloff_power: float = 1.0,
+    tile_size: int = 16,
+    dense_renderer: bool = False,
+    auto_dense_threshold: int = 20000,
+    auto_dense_pixels: int = 1_000_000,
+    use_original_resolution: bool = False,
 ) -> np.ndarray:
     if hasattr(model, "positions") and hasattr(model, "color_logits"):
         from .splat_engine import render_splats_view
 
+        render_camera = camera
+        if (
+            use_original_resolution
+            and camera.get("source_width")
+            and camera.get("source_height")
+        ):
+            render_camera = {
+                **camera,
+                "width": int(camera["source_width"]),
+                "height": int(camera["source_height"]),
+                "K": camera.get("source_K", camera["K"]),
+            }
         return render_splats_view(
             model,
-            camera,
+            render_camera,
             background,
             scene_points=scene_points,
             disk_cutoff=disk_cutoff,
             falloff_power=falloff_power,
+            tile_size=tile_size,
+            dense_renderer=dense_renderer,
+            auto_dense_threshold=auto_dense_threshold,
+            auto_dense_pixels=auto_dense_pixels,
         )
     c2w = np.asarray(camera["c2w"], dtype=np.float32)
     k = camera["K"]
@@ -1071,6 +1095,7 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
     if not heldout:
         heldout = data["cameras"][-1:]
     heldout_scores = []
+    render_original = bool(config.get("render_original_resolution", True))
     for index, camera in enumerate(heldout):
         rendered = render_view(
             trained,
@@ -1079,6 +1104,11 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
             scene_points=scene_points_np,
             disk_cutoff=float(config.get("disk_cutoff", 2.2)),
             falloff_power=float(config.get("falloff_power", 1.0)),
+            tile_size=int(config.get("render_tile_size", 16)),
+            dense_renderer=bool(config.get("dense_renderer", False)),
+            auto_dense_threshold=int(config.get("auto_dense_threshold", 20000)),
+            auto_dense_pixels=int(config.get("auto_dense_pixels", 1_000_000)),
+            use_original_resolution=render_original,
         )
         path = write_render(project_dir, f"render_eval_{index:03d}.png", rendered)
         render_paths.append(
@@ -1086,7 +1116,20 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         )
         target_index = len(data["cameras"]) - len(heldout) + index
         target = images[target_index]
-        heldout_scores.append(compute_metrics(rendered, target))
+        metric_rendered = rendered
+        if metric_rendered.shape[:2] != target.shape[:2]:
+            metric_rendered = (
+                np.asarray(
+                    Image.fromarray(
+                        (np.clip(metric_rendered, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    ).resize(
+                        (target.shape[1], target.shape[0]), Image.LANCZOS
+                    ),
+                    dtype=np.float32,
+                )
+                / 255.0
+            )
+        heldout_scores.append(compute_metrics(metric_rendered, target))
 
     novel = orbit_camera(0.7, int(config.get("resolution", 192)))
     rendered = render_view(
@@ -1096,6 +1139,10 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         scene_points=scene_points_np,
         disk_cutoff=float(config.get("disk_cutoff", 2.2)),
         falloff_power=float(config.get("falloff_power", 1.0)),
+        tile_size=int(config.get("render_tile_size", 16)),
+        dense_renderer=bool(config.get("dense_renderer", False)),
+        auto_dense_threshold=int(config.get("auto_dense_threshold", 20000)),
+        auto_dense_pixels=int(config.get("auto_dense_pixels", 1_000_000)),
     )
     novel_path = write_render(project_dir, "novel_orbit.png", rendered)
 

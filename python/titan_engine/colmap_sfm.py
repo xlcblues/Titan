@@ -291,7 +291,7 @@ def run_colmap_sfm(
                     data = load_colmap_sparse(
                         model_dir,
                         image_paths,
-                        point_limit=int(config.get("sparse_points_limit", 12000)),
+                        point_limit=int(config.get("sparse_points_limit", 50000)),
                         path_map=name_to_path,
                     )
                 except Exception as error:

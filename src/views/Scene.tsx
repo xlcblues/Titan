@@ -21,7 +21,7 @@ import {
 import { StatusPill } from "../components/StatusPill";
 import type { SceneMode, TitanSceneData } from "../lib/demoScene";
 
-type RenderFilter = "all" | "train" | "eval" | "novel";
+type RenderFilter = "all" | "train" | "eval";
 type RenderItem = { name: string; path: string; view: string };
 
 const RENDER_PAGE_SIZE = 18;
@@ -30,7 +30,6 @@ const RENDER_FILTERS: { value: RenderFilter; label: string }[] = [
   { value: "all", label: "全部" },
   { value: "train", label: "训练" },
   { value: "eval", label: "留出" },
-  { value: "novel", label: "新视角" },
 ];
 
 const MODES: {
@@ -60,7 +59,6 @@ function configNumber(value: unknown, fallback: number) {
 function viewLabel(view: string | undefined) {
   if (view === "train") return "训练视图";
   if (view === "eval") return "留出视图";
-  if (view === "novel") return "新视角";
   return "渲染";
 }
 
@@ -197,9 +195,6 @@ export function Scene() {
       path: render.path,
       view: render.view,
     })),
-    ...(scene?.novelView
-      ? [{ name: "新视角", path: scene.novelView, view: "novel" as const }]
-      : []),
   ];
   const filteredRenders = renderItems.filter(
     (render) => renderFilter === "all" || render.view === renderFilter,
@@ -387,7 +382,7 @@ export function Scene() {
                     clampedRenderPage * RENDER_PAGE_SIZE + index + 1;
                   return (
                     <figure
-                      className={`render-thumb${render.view === "novel" ? " render-thumb--novel" : ""}`}
+                      className="render-thumb"
                       key={`${render.view}-${render.name}-${absoluteIndex}`}
                     >
                       <div className="render-thumb__frame">

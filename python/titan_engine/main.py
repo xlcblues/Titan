@@ -1051,23 +1051,22 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         if sparse_points
         else np.empty((0, 3), dtype=np.float32)
     )
-    for index in (0, 2, 4):
-        if index >= len(data["cameras"]):
-            break
+    train_count = int(config.get("train_views", 16))
+    train_cameras = data["cameras"][:train_count]
+    for camera_index, camera in enumerate(train_cameras):
         rendered = render_view(
             trained,
-            data["cameras"][index],
+            camera,
             background,
             scene_points=scene_points_np,
             disk_cutoff=float(config.get("disk_cutoff", 2.2)),
             falloff_power=float(config.get("falloff_power", 1.0)),
         )
-        path = write_render(project_dir, f"render_train_{index:03d}.png", rendered)
+        path = write_render(project_dir, f"render_train_{camera_index:03d}.png", rendered)
         render_paths.append(
-            {"name": f"render_train_{index:03d}.png", "path": path, "view": "train"}
+            {"name": f"render_train_{camera_index:03d}.png", "path": path, "view": "train"}
         )
 
-    train_count = int(config.get("train_views", 16))
     heldout = data["cameras"][train_count:]
     if not heldout:
         heldout = data["cameras"][-1:]

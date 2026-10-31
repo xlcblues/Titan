@@ -1,4 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  type CSSProperties,
+} from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -340,33 +345,50 @@ export function ProjectDetail() {
               )}
             </div>
             <div className="task-split">
-              <div className="task-split__header">
-                <span className="task-split__label">训练视角</span>
+              <div className="task-split__copy">
+                <span className="task-split__label">训练 / 测试划分</span>
+                <span className="task-split__hint">
+                  {images.length > 0
+                    ? `共 ${images.length} 张，留出 ${evalViews} 张用于评估`
+                    : "导入图片后可选"}
+                </span>
+              </div>
+              <div className="task-split__control">
+                <span className="task-split__edge mono">
+                  {images.length > 0 ? minTrainViews : "—"}
+                </span>
+                <input
+                  className="task-split__range"
+                  type="range"
+                  min={minTrainViews}
+                  max={maxTrainViews}
+                  value={trainViews}
+                  step={1}
+                  style={
+                    {
+                      "--split-fill": `${
+                        ((trainViews - minTrainViews) /
+                          Math.max(1, maxTrainViews - minTrainViews)) *
+                        100
+                      }%`,
+                    } as CSSProperties
+                  }
+                  onChange={(event) => setTrainViews(Number(event.target.value))}
+                  disabled={
+                    images.length === 0 ||
+                    task?.status === "running" ||
+                    task?.status === "paused"
+                  }
+                  aria-label="训练视角数量"
+                />
+                <span className="task-split__edge mono">
+                  {images.length > 0 ? maxTrainViews : "—"}
+                </span>
                 <span className="task-split__value mono">
                   {images.length > 0
                     ? `${trainViews} 训练 / ${evalViews} 测试`
-                    : "— / —"}
+                    : "—"}
                 </span>
-              </div>
-              <input
-                className="task-split__range"
-                type="range"
-                min={minTrainViews}
-                max={maxTrainViews}
-                value={trainViews}
-                step={1}
-                onChange={(event) => setTrainViews(Number(event.target.value))}
-                disabled={
-                  images.length === 0 ||
-                  task?.status === "running" ||
-                  task?.status === "paused"
-                }
-                aria-label="训练视角数量"
-              />
-              <div className="task-split__hint">
-                {images.length > 0
-                  ? `共 ${images.length} 张，留出 ${evalViews} 张用于评估`
-                  : "导入图片后可选"}
               </div>
             </div>
             <div className="task-runner__progress">

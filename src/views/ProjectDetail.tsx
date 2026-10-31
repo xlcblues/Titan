@@ -85,19 +85,29 @@ export function ProjectDetail() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [trainViews, setTrainViews] = useState(16);
 
   const project = projects.find((item) => item.id === projectId);
   const status = projectStatusMeta(project?.status ?? "idle");
   const taskMeta = taskStatusMeta(task?.status);
+  const maxTrainViews = Math.max(1, images.length - (images.length > 1 ? 1 : 0));
+  const minTrainViews = Math.min(maxTrainViews, 4);
+  const evalViews = Math.max(0, images.length - trainViews);
+
+  useEffect(() => {
+    setTrainViews((current) =>
+      Math.min(Math.max(current, minTrainViews), maxTrainViews),
+    );
+  }, [minTrainViews, maxTrainViews]);
 
   const startTask = useCallback(async () => {
     try {
-      await start();
+      await start({ train_views: trainViews });
       setNotice("重建任务已启动");
     } catch (err) {
       setNotice(`启动失败：${err}`);
     }
-  }, [start]);
+  }, [start, trainViews]);
 
   const runPause = useCallback(async () => {
     try {
@@ -328,6 +338,36 @@ export function ProjectDetail() {
                   查看场景
                 </Link>
               )}
+            </div>
+            <div className="task-split">
+              <div className="task-split__header">
+                <span className="task-split__label">训练视角</span>
+                <span className="task-split__value mono">
+                  {images.length > 0
+                    ? `${trainViews} 训练 / ${evalViews} 测试`
+                    : "— / —"}
+                </span>
+              </div>
+              <input
+                className="task-split__range"
+                type="range"
+                min={minTrainViews}
+                max={maxTrainViews}
+                value={trainViews}
+                step={1}
+                onChange={(event) => setTrainViews(Number(event.target.value))}
+                disabled={
+                  images.length === 0 ||
+                  task?.status === "running" ||
+                  task?.status === "paused"
+                }
+                aria-label="训练视角数量"
+              />
+              <div className="task-split__hint">
+                {images.length > 0
+                  ? `共 ${images.length} 张，留出 ${evalViews} 张用于评估`
+                  : "导入图片后可选"}
+              </div>
             </div>
             <div className="task-runner__progress">
               <div className="task-stage">

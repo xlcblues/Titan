@@ -98,6 +98,10 @@ export function ProjectDetail() {
   const maxTrainViews = Math.max(1, images.length - (images.length > 1 ? 1 : 0));
   const minTrainViews = Math.min(maxTrainViews, 4);
   const evalViews = Math.max(0, images.length - trainViews);
+  const splitDisabled =
+    images.length === 0 ||
+    task?.status === "running" ||
+    task?.status === "paused";
 
   useEffect(() => {
     setTrainViews((current) =>
@@ -343,20 +347,11 @@ export function ProjectDetail() {
                   查看场景
                 </Link>
               )}
-            </div>
-            <div className="task-split">
-              <div className="task-split__copy">
-                <span className="task-split__label">训练 / 测试划分</span>
-                <span className="task-split__hint">
-                  {images.length > 0
-                    ? `共 ${images.length} 张，留出 ${evalViews} 张用于评估`
-                    : "导入图片后可选"}
-                </span>
-              </div>
-              <div className="task-split__control">
-                <span className="task-split__edge mono">
-                  {images.length > 0 ? minTrainViews : "—"}
-                </span>
+              <label
+                className={`task-split${splitDisabled ? " task-split--disabled" : ""}`}
+                title="训练视角数量"
+              >
+                <span className="task-split__label">视角划分</span>
                 <input
                   className="task-split__range"
                   type="range"
@@ -374,22 +369,15 @@ export function ProjectDetail() {
                     } as CSSProperties
                   }
                   onChange={(event) => setTrainViews(Number(event.target.value))}
-                  disabled={
-                    images.length === 0 ||
-                    task?.status === "running" ||
-                    task?.status === "paused"
-                  }
+                  disabled={splitDisabled}
                   aria-label="训练视角数量"
                 />
-                <span className="task-split__edge mono">
-                  {images.length > 0 ? maxTrainViews : "—"}
-                </span>
                 <span className="task-split__value mono">
                   {images.length > 0
                     ? `${trainViews} 训练 / ${evalViews} 测试`
                     : "—"}
                 </span>
-              </div>
+              </label>
             </div>
             <div className="task-runner__progress">
               <div className="task-stage">

@@ -1107,56 +1107,31 @@
 }
 
 .task-split {
-  order: 3;
-  flex: 1 1 100%;
-  min-width: 0;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  padding-top: 14px;
+  gap: 10px;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+  transition: border-color 100ms ease;
 }
 
-.task-split__copy {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
+.task-split:hover:not(.task-split--disabled) {
+  border-color: var(--line-strong);
 }
 
 .task-split__label {
-  color: var(--text);
-  font-size: 13px;
-  line-height: 20px;
-}
-
-.task-split__hint {
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   font-size: 12px;
   line-height: 16px;
-  overflow-wrap: anywhere;
-}
-
-.task-split__control {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex: 1;
-  max-width: 460px;
-  min-width: 220px;
-}
-
-.task-split__edge {
-  flex: 0 0 auto;
-  color: var(--text-tertiary);
-  font-size: 12px;
-  line-height: 18px;
-  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .task-split__value {
-  flex: 0 0 auto;
-  min-width: 128px;
+  width: 112px;
   color: var(--text);
   font-size: 12px;
   line-height: 18px;
@@ -1166,14 +1141,26 @@
 }
 
 .task-split__range {
-  flex: 1;
-  min-width: 0;
+  width: 140px;
   height: 18px;
   margin: 0;
   appearance: none;
   -webkit-appearance: none;
   background: transparent;
   cursor: pointer;
+}
+
+.task-split--disabled {
+  cursor: not-allowed;
+}
+
+.task-split--disabled .task-split__label,
+.task-split--disabled .task-split__value {
+  color: var(--text-tertiary);
+}
+
+.task-split--disabled .task-split__range {
+  cursor: not-allowed;
 }
 
 .task-split__range::-webkit-slider-runnable-track {
@@ -1443,18 +1430,13 @@
   }
 
   .task-split {
-    align-items: stretch;
-    gap: 10px;
+    flex: 1 1 auto;
   }
 
-  .task-split__control {
-    max-width: none;
-    min-width: 0;
-  }
-
-  .task-split__value {
-    min-width: 0;
-    white-space: normal;
+  .task-split__range {
+    flex: 1;
+    width: auto;
+    min-width: 96px;
   }
 
   .toolbar {

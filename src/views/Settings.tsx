@@ -2,11 +2,18 @@ import { useState } from "react";
 import { ChevronDown, Cpu, FileCode2, Gauge, Info } from "lucide-react";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { useAppInfo } from "../hooks/useAppInfo";
+import {
+  readReconstructionSettings,
+  TRAINING_QUALITY_OPTIONS,
+  trainingQualityPreset,
+  writeReconstructionSettings,
+  type TrainingQuality,
+} from "../lib/reconstructionSettings";
 
 export function Settings() {
   const info = useAppInfo();
   const [gpuBudget, setGpuBudget] = useState("8GB");
-  const [resolution, setResolution] = useState("1280 × 720");
+  const [settings, setSettings] = useState(() => readReconstructionSettings());
   const [mixedPrecision, setMixedPrecision] = useState(true);
 
   return (
@@ -76,17 +83,25 @@ export function Settings() {
               </div>
             </div>
             <div className="field-row">
-              <span className="field-row__label">训练分辨率</span>
+              <span className="field-row__label">训练画质</span>
               <div className="select-wrap">
                 <select
                   className="input select"
-                  value={resolution}
-                  onChange={(event) => setResolution(event.currentTarget.value)}
-                  aria-label="训练分辨率"
+                  value={settings.quality}
+                  onChange={(event) => {
+                    const quality = event.currentTarget
+                      .value as TrainingQuality;
+                    const next = trainingQualityPreset(quality);
+                    setSettings(next);
+                    writeReconstructionSettings(next);
+                  }}
+                  aria-label="训练画质"
                 >
-                  <option>960 × 540</option>
-                  <option>1280 × 720</option>
-                  <option>1920 × 1080</option>
+                  {TRAINING_QUALITY_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
                 </select>
                 <ChevronDown size={16} className="select-chevron" aria-hidden="true" />
               </div>

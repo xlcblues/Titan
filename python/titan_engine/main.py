@@ -307,31 +307,55 @@ def load_and_prepare_images(
     cameras: list[dict],
     config: dict,
 ) -> np.ndarray:
-    """Load images and normalize them to a square training grid.
+    """Load images and normalize them to the training grid.
 
-    Images keep their original aspect ratio: each frame is scaled to fit
-    inside the square target and letterboxed. Camera intrinsics are scaled
-    by the same factor and shifted by the letterbox offset, so focal length
-    and principal point are not discarded as they were in the M4 baseline.
+    In original-resolution mode the common canvas is derived from the largest
+    source frame and is only scaled down when it exceeds
+    ``train_max_image_pixels``, so training sees near-native detail instead of
+    the fixed low-resolution square. Otherwise images are letterboxed into the
+    ``resolution`` square as before. Camera intrinsics are scaled by the same
+    factor and shifted by the letterbox offset in both modes.
     """
     resolution = int(config.get("resolution", 192))
-    target = (resolution, resolution)
-    images = []
+    original = bool(config.get("train_original_resolution", False))
+    max_pixels = int(config.get("train_max_image_pixels", 2_000_000))
+
     actual_sizes: list[tuple[int, int]] = []
     for path in paths:
         with Image.open(path) as source:
-            image = source.convert("RGB")
-            source_width, source_height = image.size
+            source_width, source_height = source.size
             actual_sizes.append((source_width, source_height))
-            scale = min(resolution / source_width, resolution / source_height)
+
+    if original:
+        max_width = max(size[0] for size in actual_sizes)
+        max_height = max(size[1] for size in actual_sizes)
+        pixel_scale = math.sqrt(max_pixels / max(max_width * max_height, 1))
+        if pixel_scale >= 1.0:
+            target_width, target_height = max_width, max_height
+        else:
+            target_width = max(1, int(round(max_width * pixel_scale)))
+            target_height = max(1, int(round(max_height * pixel_scale)))
+    else:
+        target_width, target_height = resolution, resolution
+
+    images = []
+    for path, (source_width, source_height) in zip(paths, actual_sizes):
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+            scale = min(
+                target_width / source_width,
+                target_height / source_height,
+            )
             scaled_size = (
                 max(1, round(source_width * scale)),
                 max(1, round(source_height * scale)),
             )
             scaled = image.resize(scaled_size, Image.LANCZOS)
-            canvas = Image.new("RGB", target, (0, 0, 0))
-            offset_x = (resolution - scaled_size[0]) // 2
-            offset_y = (resolution - scaled_size[1]) // 2
+            canvas = Image.new(
+                "RGB", (target_width, target_height), (0, 0, 0)
+            )
+            offset_x = (target_width - scaled_size[0]) // 2
+            offset_y = (target_height - scaled_size[1]) // 2
             canvas.paste(scaled, (offset_x, offset_y))
             images.append(np.asarray(canvas, dtype=np.float32) / 255.0)
 
@@ -360,17 +384,17 @@ def load_and_prepare_images(
                 [0.0, float(source_k[1][1]) * scale_y, float(source_k[1][2]) * scale_y],
                 [0.0, 0.0, 1.0],
             ]
-        scale = min(resolution / actual_width, resolution / actual_height)
+        scale = min(target_width / actual_width, target_height / actual_height)
         scaled_width = max(1, round(actual_width * scale))
         scaled_height = max(1, round(actual_height * scale))
-        offset_x = (resolution - scaled_width) / 2.0
-        offset_y = (resolution - scaled_height) / 2.0
+        offset_x = (target_width - scaled_width) / 2.0
+        offset_y = (target_height - scaled_height) / 2.0
         fx = float(source_k[0][0]) * scale
         fy = float(source_k[1][1]) * scale
         cx = float(source_k[0][2]) * scale + offset_x
         cy = float(source_k[1][2]) * scale + offset_y
-        camera["width"] = resolution
-        camera["height"] = resolution
+        camera["width"] = target_width
+        camera["height"] = target_height
         camera["K"] = [
             [fx, 0.0, cx],
             [0.0, fy, cy],
@@ -599,6 +623,10 @@ def render_view(
     dense_renderer: bool = False,
     auto_dense_threshold: int = 20000,
     auto_dense_pixels: int = 1_000_000,
+    tile_pair_budget: int = 4_000_000,
+    tile_max_splats: int = 8192,
+    tile_work_budget: int = 2_000_000,
+    use_cuda_tile: bool = False,
     use_original_resolution: bool = False,
 ) -> np.ndarray:
     if hasattr(model, "positions") and hasattr(model, "color_logits"):
@@ -627,6 +655,10 @@ def render_view(
             dense_renderer=dense_renderer,
             auto_dense_threshold=auto_dense_threshold,
             auto_dense_pixels=auto_dense_pixels,
+            tile_pair_budget=tile_pair_budget,
+            tile_max_splats=tile_max_splats,
+            tile_work_budget=tile_work_budget,
+            use_cuda_tile=use_cuda_tile,
         )
     c2w = np.asarray(camera["c2w"], dtype=np.float32)
     k = camera["K"]
@@ -1033,7 +1065,15 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
     if not data["images"]:
         raise RuntimeError("项目没有可用图片或位姿")
     images = load_and_prepare_images(data["images"], data["cameras"], config)
-    log(f"[data] 图片 {len(data['images'])} 张，尺寸 {images.shape[1]}x{images.shape[2]}")
+    train_resolution_note = (
+        "（原分辨率）"
+        if config.get("train_original_resolution")
+        else ""
+    )
+    log(
+        f"[data] 图片 {len(data['images'])} 张，"
+        f"训练尺寸 {images.shape[1]}x{images.shape[2]}{train_resolution_note}"
+    )
 
     _, device_name = prepare_device(config)
     sparse_points = data["points"] or build_sparse_points(data["cameras"])
@@ -1085,6 +1125,14 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
             scene_points=scene_points_np,
             disk_cutoff=float(config.get("disk_cutoff", 2.2)),
             falloff_power=float(config.get("falloff_power", 1.0)),
+            tile_size=int(config.get("render_tile_size", 16)),
+            dense_renderer=bool(config.get("dense_renderer", False)),
+            auto_dense_threshold=int(config.get("auto_dense_threshold", 20000)),
+            auto_dense_pixels=int(config.get("auto_dense_pixels", 1_000_000)),
+            tile_pair_budget=int(config.get("tile_pair_budget", 4_000_000)),
+            tile_max_splats=int(config.get("tile_max_splats", 8192)),
+            tile_work_budget=int(config.get("tile_work_budget", 2_000_000)),
+            use_cuda_tile=bool(config.get("use_cuda_tile", True)),
         )
         path = write_render(project_dir, f"render_train_{camera_index:03d}.png", rendered)
         render_paths.append(
@@ -1108,6 +1156,10 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
             dense_renderer=bool(config.get("dense_renderer", False)),
             auto_dense_threshold=int(config.get("auto_dense_threshold", 20000)),
             auto_dense_pixels=int(config.get("auto_dense_pixels", 1_000_000)),
+            tile_pair_budget=int(config.get("tile_pair_budget", 4_000_000)),
+            tile_max_splats=int(config.get("tile_max_splats", 8192)),
+            tile_work_budget=int(config.get("tile_work_budget", 2_000_000)),
+            use_cuda_tile=bool(config.get("use_cuda_tile", True)),
             use_original_resolution=render_original,
         )
         path = write_render(project_dir, f"render_eval_{index:03d}.png", rendered)
@@ -1143,6 +1195,10 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         dense_renderer=bool(config.get("dense_renderer", False)),
         auto_dense_threshold=int(config.get("auto_dense_threshold", 20000)),
         auto_dense_pixels=int(config.get("auto_dense_pixels", 1_000_000)),
+        tile_pair_budget=int(config.get("tile_pair_budget", 4_000_000)),
+        tile_max_splats=int(config.get("tile_max_splats", 8192)),
+        tile_work_budget=int(config.get("tile_work_budget", 2_000_000)),
+        use_cuda_tile=bool(config.get("use_cuda_tile", True)),
     )
     novel_path = write_render(project_dir, "novel_orbit.png", rendered)
 

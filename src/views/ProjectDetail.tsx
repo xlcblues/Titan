@@ -27,6 +27,10 @@ import { DeleteProjectDialog } from "../components/DeleteProjectDialog";
 import { StatusPill } from "../components/StatusPill";
 import { useProjectImages, useProjects } from "../hooks/useProjects";
 import { useTasks } from "../hooks/useTasks";
+import {
+  readReconstructionSettings,
+  reconstructionConfig,
+} from "../lib/reconstructionSettings";
 import { projectStatusMeta } from "../utils/projectMeta";
 
 function formatBytes(size: number | null) {
@@ -111,7 +115,10 @@ export function ProjectDetail() {
 
   const startTask = useCallback(async () => {
     try {
-      await start({ train_views: trainViews });
+      await start({
+        train_views: trainViews,
+        ...reconstructionConfig(readReconstructionSettings()),
+      });
       setNotice("重建任务已启动");
     } catch (err) {
       setNotice(`启动失败：${err}`);

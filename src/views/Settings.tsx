@@ -5,6 +5,8 @@ import { useAppInfo } from "../hooks/useAppInfo";
 import {
   readReconstructionSettings,
   TRAINING_QUALITY_OPTIONS,
+  TRAINING_STEPS_MAX,
+  TRAINING_STEPS_MIN,
   trainingQualityPreset,
   writeReconstructionSettings,
   type TrainingQuality,
@@ -14,7 +16,24 @@ export function Settings() {
   const info = useAppInfo();
   const [gpuBudget, setGpuBudget] = useState("8GB");
   const [settings, setSettings] = useState(() => readReconstructionSettings());
+  const [stepsDraft, setStepsDraft] = useState(() => String(settings.steps));
   const [mixedPrecision, setMixedPrecision] = useState(true);
+
+  const commitSteps = () => {
+    const parsed = Number(stepsDraft);
+    const steps = Number.isFinite(parsed)
+      ? Math.min(
+          TRAINING_STEPS_MAX,
+          Math.max(TRAINING_STEPS_MIN, Math.round(parsed)),
+        )
+      : settings.steps;
+    setStepsDraft(String(steps));
+    setSettings((current) => {
+      const next = { ...current, steps };
+      writeReconstructionSettings(next);
+      return next;
+    });
+  };
 
   return (
     <>
@@ -91,7 +110,11 @@ export function Settings() {
                   onChange={(event) => {
                     const quality = event.currentTarget
                       .value as TrainingQuality;
-                    const next = trainingQualityPreset(quality);
+                    const next = {
+                      ...trainingQualityPreset(quality),
+                      steps: settings.steps,
+                    };
+                    setStepsDraft(String(settings.steps));
                     setSettings(next);
                     writeReconstructionSettings(next);
                   }}
@@ -105,6 +128,25 @@ export function Settings() {
                 </select>
                 <ChevronDown size={16} className="select-chevron" aria-hidden="true" />
               </div>
+            </div>
+            <div className="field-row">
+              <span className="field-row__label">训练步数</span>
+              <input
+                className="input field-row__number"
+                type="number"
+                min={TRAINING_STEPS_MIN}
+                max={TRAINING_STEPS_MAX}
+                step={100}
+                value={stepsDraft}
+                onChange={(event) => setStepsDraft(event.currentTarget.value)}
+                onBlur={commitSteps}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.currentTarget.blur();
+                  }
+                }}
+                aria-label="训练步数"
+              />
             </div>
             <div className="field-row">
               <span className="field-row__label">混合精度</span>

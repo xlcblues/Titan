@@ -899,6 +899,11 @@
   min-width: 0;
 }
 
+.field-row__number {
+  width: 120px;
+  text-align: right;
+}
+
 .select-wrap {
   position: relative;
 }

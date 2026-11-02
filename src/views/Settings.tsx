@@ -1,12 +1,13 @@
 import { useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { check } from "@tauri-apps/plugin-updater";
 import {
   ChevronDown,
   Cpu,
+  Download,
   FileCode2,
   FolderOpen,
   Info,
+  Loader2,
   RefreshCw,
 } from "lucide-react";
 import { ThemeToggle } from "../components/ThemeToggle";
@@ -22,6 +23,10 @@ import {
   writeReconstructionSettings,
   type TrainingQuality,
 } from "../lib/reconstructionSettings";
+import {
+  FALLBACK_VERSION,
+  useUpdater,
+} from "../lib/updater";
 
 interface Diagnostics {
   app: string;
@@ -43,8 +48,34 @@ export function Settings() {
   const [mixedPrecision, setMixedPrecision] = useState(true);
   const [pythonPath, setPythonPath] = useState("");
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [updateNote, setUpdateNote] = useState("");
+  const updater = useUpdater({ autoCheck: true, checkDelay: 1400 });
+  const updateState = updater.state;
+  const currentVersion = updateState.currentVersion ?? FALLBACK_VERSION;
+  const updateBusy =
+    updateState.status === "checking" ||
+    updateState.status === "downloading" ||
+    updateState.status === "installing";
+
+  let updateStatusText = "未检查";
+  if (updateState.status === "checking") {
+    updateStatusText = "正在检查更新…";
+  } else if (updateState.status === "latest") {
+    updateStatusText = "已是最新版本";
+  } else if (updateState.status === "available") {
+    updateStatusText = `发现新版本 v${updateState.version ?? ""}`;
+  } else if (updateState.status === "downloading") {
+    updateStatusText =
+      updateState.progress && updateState.progress > 0
+        ? `已下载 ${updateState.progress}%`
+        : `正在下载 v${updateState.version ?? ""}`;
+  } else if (updateState.status === "installing") {
+    updateStatusText = "正在安装，完成后自动重启";
+  } else if (updateState.status === "error") {
+    updateStatusText =
+      updateState.message === "unsupported"
+        ? "当前环境不支持在线更新"
+        : "检查更新失败";
+  }
 
   const detectEnvironment = async () => {
     try {
@@ -61,22 +92,6 @@ export function Settings() {
       await invoke("open_log_dir");
     } catch {
       // Browser preview without the Tauri runtime.
-    }
-  };
-
-  const checkUpdates = async () => {
-    if (checkingUpdate) {
-      return;
-    }
-    setCheckingUpdate(true);
-    setUpdateNote("正在检查...");
-    try {
-      const update = await check();
-      setUpdateNote(update ? `发现新版本 ${update.version}` : "当前已是最新版本");
-    } catch {
-      setUpdateNote("检查失败，请确认更新源配置");
-    } finally {
-      setCheckingUpdate(false);
     }
   };
 
@@ -274,7 +289,7 @@ export function Settings() {
               </div>
               <div className="info-row">
                 <span className="info-row__label">版本</span>
-                <span className="info-row__value mono">{info.version}</span>
+                <span className="info-row__value mono">{currentVersion}</span>
               </div>
               <div className="info-row">
                 <span className="info-row__label">算法</span>
@@ -317,8 +332,47 @@ export function Settings() {
                 </>
               )}
             </div>
+            <div className="update-block">
+              <div className="update-block__row">
+                <span className="update-block__label">更新状态</span>
+                <strong
+                  className={`update-block__value${
+                    updateState.status === "error"
+                      ? " update-block__value--error"
+                      : ""
+                  }`}
+                >
+                  {updateStatusText}
+                </strong>
+              </div>
+              {updateState.status === "available" && updateState.body ? (
+                <div className="update-notes">{updateState.body}</div>
+              ) : null}
+              {updateState.status === "downloading" ? (
+                <div className="update-download">
+                  <div
+                    className={`progress update-progress${
+                      updateState.progress ? "" : " indeterminate"
+                    }`}
+                  >
+                    <div
+                      className="progress__bar"
+                      style={{ width: `${updateState.progress ?? 38}%` }}
+                    />
+                  </div>
+                  <span className="update-download__meta">
+                    {updateState.progress
+                      ? `已下载 ${updateState.progress}%`
+                      : `正在下载 v${updateState.version ?? ""}`}
+                  </span>
+                </div>
+              ) : null}
+              {updateState.status === "error" &&
+              updateState.message !== "unsupported" ? (
+                <div className="update-error">{updateState.message}</div>
+              ) : null}
+            </div>
             <div className="panel__footer">
-              <span className="panel__note">{updateNote}</span>
               <button
                 className="btn btn--ghost"
                 type="button"
@@ -330,12 +384,27 @@ export function Settings() {
               <button
                 className="btn btn--ghost"
                 type="button"
-                onClick={checkUpdates}
-                disabled={checkingUpdate}
+                onClick={() => void updater.checkNow()}
+                disabled={updateBusy}
               >
-                <RefreshCw size={16} className={checkingUpdate ? "spin" : ""} />
-                检查更新
+                {updateState.status === "checking" ? (
+                  <Loader2 size={16} className="spin" />
+                ) : (
+                  <RefreshCw size={16} />
+                )}
+                {updateState.status === "checking" ? "检查中" : "检查更新"}
               </button>
+              {updateState.status === "available" ? (
+                <button
+                  className="btn btn--primary"
+                  type="button"
+                  onClick={() => void updater.install()}
+                  disabled={updateBusy}
+                >
+                  <Download size={16} />
+                  立即更新
+                </button>
+              ) : null}
             </div>
           </section>
         </div>

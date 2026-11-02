@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Titan",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.titan.reconstruction",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -44,6 +44,8 @@
   },
   "plugins": {
     "updater": {
+      "active": true,
+      "dialog": false,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJGRDZDQUU2MTY5M0UwRTMKUldUajRKTVc1c3JXdjdxdXYvQjN2eHd6bmtxa3NXUWl1cXdmbEVXREcrTk1CMHU1dXdnOUZoSFQK",
       "endpoints": [
         "https://github.com/xlcblues/Titan/releases/latest/download/latest.json"

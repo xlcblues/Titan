@@ -596,13 +596,25 @@ def render_rays(
 def ray_bounds_from_points(
     origin: np.ndarray,
     points: np.ndarray,
-    near_fraction: float = 0.75,
-    far_fraction: float = 1.35,
+    rotation: np.ndarray | None = None,
+    near_fraction: float = 0.6,
+    far_fraction: float = 1.5,
 ) -> tuple[float, float]:
     """Choose near/far from the actual point distribution seen by a camera."""
     if len(points) == 0:
         return 0.3, 7.6
-    depths = np.linalg.norm(points - np.asarray(origin, dtype=np.float32), axis=1)
+    points = np.asarray(points, dtype=np.float32)
+    origin = np.asarray(origin, dtype=np.float32)
+    if rotation is not None:
+        camera_space = (points - origin[None, :]) @ np.asarray(
+            rotation, dtype=np.float32
+        )
+        depths = camera_space[:, 2]
+        depths = depths[depths > 1e-4]
+    else:
+        depths = np.linalg.norm(points - origin[None, :], axis=1)
+    if depths.size == 0:
+        return 0.3, 7.6
     lower = float(np.percentile(depths, 5.0))
     upper = float(np.percentile(depths, 95.0))
     if not np.isfinite(lower) or not np.isfinite(upper) or upper <= 1e-6:
@@ -672,7 +684,7 @@ def render_view(
     directions = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
     flat_dirs = directions.reshape(-1, 3)
     near, far = (
-        ray_bounds_from_points(origin, scene_points)
+        ray_bounds_from_points(origin, scene_points, rotation=rotation)
         if scene_points is not None and len(scene_points)
         else (2.4, 7.6)
     )
@@ -736,6 +748,62 @@ def orbit_camera(angle: float, size: int) -> dict:
     )
     forward = -position / np.linalg.norm(position)
     up = np.array([0.0, 1.0, 0.0])
+    right = np.cross(up, forward)
+    right /= np.linalg.norm(right)
+    up = np.cross(forward, right)
+    c2w = np.eye(4)
+    c2w[:3, :3] = np.stack([right, up, forward], axis=1)
+    c2w[:3, 3] = position
+    focal = size * 1.15
+    return {
+        "width": size,
+        "height": size,
+        "K": [[focal, 0.0, size / 2.0], [0.0, focal, size / 2.0], [0.0, 0.0, 1.0]],
+        "c2w": c2w.tolist(),
+    }
+
+
+def orbit_camera_around_scene(
+    angle: float,
+    size: int,
+    scene_points: np.ndarray | None = None,
+    cameras: list[dict] | None = None,
+) -> dict:
+    """Build a novel view that fits the observed scene instead of a fixed orbit."""
+    center = np.zeros(3, dtype=np.float64)
+    radius = 5.4
+    if scene_points is not None and len(scene_points):
+        points = np.asarray(scene_points, dtype=np.float64).reshape(-1, 3)
+        center = np.median(points, axis=0)
+        lo = np.quantile(points, 0.1, axis=0)
+        hi = np.quantile(points, 0.9, axis=0)
+        radius = max(float(np.linalg.norm(hi - lo)) * 0.65, 0.25)
+    if cameras:
+        origins = np.asarray(
+            [
+                np.asarray(camera["c2w"], dtype=np.float64)[:3, 3]
+                for camera in cameras
+            ],
+            dtype=np.float64,
+        ).reshape(-1, 3)
+        camera_dist = np.linalg.norm(origins - center[None, :], axis=1)
+        radius = max(
+            radius,
+            float(np.quantile(camera_dist, 0.9)) * 1.4,
+            float(np.quantile(camera_dist, 0.5)) * 1.8,
+        )
+    elevation = 0.16
+    position = center + np.asarray(
+        [
+            math.cos(angle) * math.cos(elevation),
+            math.sin(elevation),
+            math.sin(angle) * math.cos(elevation),
+        ],
+        dtype=np.float64,
+    ) * radius
+    forward = center - position
+    forward /= np.linalg.norm(forward)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     right = np.cross(up, forward)
     right /= np.linalg.norm(right)
     up = np.cross(forward, right)
@@ -846,7 +914,9 @@ def train_tfrf(
         directions = local @ rotation.T
         directions = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
 
-        near, far = ray_bounds_from_points(origin, scene_points)
+        near, far = ray_bounds_from_points(
+            origin, scene_points, rotation=rotation
+        )
         rendered = render_rays(
             model,
             origin,
@@ -1183,7 +1253,12 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
             )
         heldout_scores.append(compute_metrics(metric_rendered, target))
 
-    novel = orbit_camera(0.7, int(config.get("resolution", 192)))
+    novel = orbit_camera_around_scene(
+        0.7,
+        int(config.get("resolution", 192)),
+        scene_points=scene_points_np,
+        cameras=data["cameras"],
+    )
     rendered = render_view(
         trained,
         novel,
@@ -1208,6 +1283,11 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         "loss": float(np.mean([item["loss"] for item in heldout_scores])),
         "vramMB": int(history[-1]["vramMB"]) if history else 0,
         "views": len(heldout_scores),
+        "splatCount": int(trained.positions.shape[0])
+        if hasattr(trained, "positions")
+        else 0,
+        "splatLimit": int(history[-1].get("splatLimit", 0)) if history else 0,
+        "vramFreeMB": int(history[-1].get("vramFreeMB", 0)) if history else 0,
     }
     engine = trained_result.get("engine", "facets") if isinstance(trained_result, dict) else "facets"
     write_scene_output(

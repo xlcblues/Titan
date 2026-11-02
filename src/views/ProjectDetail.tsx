@@ -75,6 +75,19 @@ function formatMetric(value: number | undefined, digits: number, suffix = "") {
     : "—";
 }
 
+function formatCount(value: number | undefined) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.round(value).toLocaleString()
+    : "—";
+}
+
+function vramPressureLabel(value: number | undefined) {
+  if (value === 0) return "正常";
+  if (value === 1) return "紧张";
+  if (value === 2) return "告警";
+  return "—";
+}
+
 export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const projectId = id ?? "";
@@ -447,6 +460,25 @@ export function ProjectDetail() {
               <span className="metric-row__label">显存</span>
               <span className="metric-row__value mono">
                 {formatMetric(task?.latest?.vramMB, 0, " MB")}
+              </span>
+            </div>
+            <div className="metric-row">
+              <span className="metric-row__label">棱面</span>
+              <span className="metric-row__value mono">
+                {formatCount(task?.latest?.splatCount)} /{" "}
+                {formatCount(task?.latest?.splatLimit)}
+              </span>
+            </div>
+            <div className="metric-row">
+              <span className="metric-row__label">显存空闲</span>
+              <span className="metric-row__value mono">
+                {formatMetric(task?.latest?.vramFreeMB, 0, " MB")}
+              </span>
+            </div>
+            <div className="metric-row">
+              <span className="metric-row__label">显存压力</span>
+              <span className="metric-row__value mono">
+                {vramPressureLabel(task?.latest?.vramPressure)}
               </span>
             </div>
           </div>

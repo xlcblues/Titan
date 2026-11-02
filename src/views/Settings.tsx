@@ -1,9 +1,20 @@
-import { useState } from "react";
-import { ChevronDown, Cpu, FileCode2, Gauge, Info } from "lucide-react";
+import { useState, type CSSProperties } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { check } from "@tauri-apps/plugin-updater";
+import {
+  ChevronDown,
+  Cpu,
+  FileCode2,
+  FolderOpen,
+  Info,
+  RefreshCw,
+} from "lucide-react";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { useAppInfo } from "../hooks/useAppInfo";
 import {
   readReconstructionSettings,
+  MAX_SPLATS_MAX,
+  MAX_SPLATS_MIN,
   TRAINING_QUALITY_OPTIONS,
   TRAINING_STEPS_MAX,
   TRAINING_STEPS_MIN,
@@ -12,12 +23,62 @@ import {
   type TrainingQuality,
 } from "../lib/reconstructionSettings";
 
+interface Diagnostics {
+  app: string;
+  version: string;
+  os: string;
+  arch: string;
+  cpuCores: number;
+  gpu: string | null;
+  python: string | null;
+  logDir: string;
+  crashDir: string;
+}
+
 export function Settings() {
   const info = useAppInfo();
   const [gpuBudget, setGpuBudget] = useState("8GB");
   const [settings, setSettings] = useState(() => readReconstructionSettings());
   const [stepsDraft, setStepsDraft] = useState(() => String(settings.steps));
   const [mixedPrecision, setMixedPrecision] = useState(true);
+  const [pythonPath, setPythonPath] = useState("");
+  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateNote, setUpdateNote] = useState("");
+
+  const detectEnvironment = async () => {
+    try {
+      const result = await invoke<Diagnostics>("get_diagnostics");
+      setDiagnostics(result);
+      setPythonPath(result.python ?? "");
+    } catch {
+      setDiagnostics(null);
+    }
+  };
+
+  const openLogs = async () => {
+    try {
+      await invoke("open_log_dir");
+    } catch {
+      // Browser preview without the Tauri runtime.
+    }
+  };
+
+  const checkUpdates = async () => {
+    if (checkingUpdate) {
+      return;
+    }
+    setCheckingUpdate(true);
+    setUpdateNote("正在检查...");
+    try {
+      const update = await check();
+      setUpdateNote(update ? `发现新版本 ${update.version}` : "当前已是最新版本");
+    } catch {
+      setUpdateNote("检查失败，请确认更新源配置");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
 
   const commitSteps = () => {
     const parsed = Number(stepsDraft);
@@ -63,10 +124,15 @@ export function Settings() {
               <div className="field-row__control">
                 <input
                   className="input field-row__input"
-                  defaultValue=""
+                  value={pythonPath}
+                  onChange={(event) => setPythonPath(event.currentTarget.value)}
                   placeholder="未配置"
                 />
-                <button className="btn btn--secondary" type="button">
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={detectEnvironment}
+                >
                   检测
                 </button>
               </div>
@@ -149,6 +215,39 @@ export function Settings() {
               />
             </div>
             <div className="field-row">
+              <span className="field-row__label">棱面上限</span>
+              <div className="field-row__control">
+                <input
+                  className="field-row__range"
+                  type="range"
+                  min={MAX_SPLATS_MIN}
+                  max={MAX_SPLATS_MAX}
+                  step={5000}
+                  value={settings.maxSplats}
+                  onChange={(event) => {
+                    const next = {
+                      ...settings,
+                      maxSplats: Number(event.currentTarget.value),
+                    };
+                    setSettings(next);
+                    writeReconstructionSettings(next);
+                  }}
+                  style={
+                    {
+                      "--split-fill": `${((settings.maxSplats -
+                        MAX_SPLATS_MIN) /
+                        (MAX_SPLATS_MAX - MAX_SPLATS_MIN)) *
+                        100}%`,
+                    } as CSSProperties
+                  }
+                  aria-label="棱面上限"
+                />
+                <span className="info-row__value mono">
+                  {settings.maxSplats.toLocaleString()}
+                </span>
+              </div>
+            </div>
+            <div className="field-row">
               <span className="field-row__label">混合精度</span>
               <label className="switch">
                 <input
@@ -189,11 +288,53 @@ export function Settings() {
                 <span className="info-row__label">平台</span>
                 <span className="info-row__value">{info.targetPlatform}</span>
               </div>
+              {diagnostics && (
+                <>
+                  <div className="info-row">
+                    <span className="info-row__label">GPU</span>
+                    <span className="info-row__value mono">
+                      {diagnostics.gpu ?? "未检测到 NVIDIA GPU"}
+                    </span>
+                  </div>
+                  <div className="info-row">
+                    <span className="info-row__label">Python</span>
+                    <span className="info-row__value mono">
+                      {diagnostics.python ?? "未找到"}
+                    </span>
+                  </div>
+                  <div className="info-row">
+                    <span className="info-row__label">日志目录</span>
+                    <span className="info-row__value mono">
+                      {diagnostics.logDir}
+                    </span>
+                  </div>
+                  <div className="info-row">
+                    <span className="info-row__label">崩溃目录</span>
+                    <span className="info-row__value mono">
+                      {diagnostics.crashDir}
+                    </span>
+                  </div>
+                </>
+              )}
             </div>
             <div className="panel__footer">
-              <button className="btn btn--ghost" type="button">
-                <Gauge size={16} />
+              <span className="panel__note">{updateNote}</span>
+              <button
+                className="btn btn--ghost"
+                type="button"
+                onClick={openLogs}
+              >
+                <FolderOpen size={16} />
                 打开日志目录
+              </button>
+              <button
+                className="btn btn--ghost"
+                type="button"
+                onClick={checkUpdates}
+                disabled={checkingUpdate}
+              >
+                <RefreshCw size={16} className={checkingUpdate ? "spin" : ""} />
+                检查更新
               </button>
             </div>
           </section>

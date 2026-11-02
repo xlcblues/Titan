@@ -156,6 +156,15 @@ export function Scene() {
         { label: "SSIM", value: formatMetric(metrics?.ssim, 3) },
         { label: "Loss", value: formatMetric(metrics?.loss, 4) },
         { label: "显存峰值", value: formatMetric(metrics?.vramMB, 0, " MB") },
+        { label: "棱面", value: formatMetric(metrics?.splatCount, 0) },
+        {
+          label: "棱面上限",
+          value: formatMetric(metrics?.splatLimit, 0),
+        },
+        {
+          label: "显存空闲",
+          value: formatMetric(metrics?.vramFreeMB, 0, " MB"),
+        },
         { label: "留出视图", value: formatMetric(metrics?.views, 0, " 视图") },
       ]
     : [

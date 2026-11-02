@@ -9,6 +9,8 @@ Titan 是面向 Windows 桌面端的三维重建软件，采用自研的 Facet R
 - 深浅主题切换，跟随系统主题
 - 极简 Titan Logo 与统一 UI 设计规范
 - Tauri 2 + React + Rust 桌面架构
+- 应用日志、崩溃报告与环境诊断
+- 自动更新与可分发安装包
 
 ## 里程碑
 
@@ -19,6 +21,17 @@ Titan 是面向 Windows 桌面端的三维重建软件，采用自研的 Facet R
 | M2 | 项目创建、图片拖拽导入、缩略图、SQLite 持久化 | 已完成 |
 | M3 | 重建管线与渲染场景接入 | 已完成 |
 | M4 | 任务引擎、指标回传、渲染导出与真实场景预览 | 已完成 |
+| M5 | 自动更新、崩溃上报、日志、性能优化、打包签名 | 已完成 |
+
+## 工程化与分发
+
+- 日志：`tauri-plugin-log` 写入应用日志目录，单文件 2MB、保留 5 份、按天轮换，并转发 Webview 日志。
+- 崩溃上报：Rust panic hook 与前端未捕获异常都会写入 `app_data_dir/crash/`。
+- 环境诊断：设置页可检测 GPU、Python、CPU、日志与崩溃目录。
+- 自动更新：使用 `tauri-plugin-updater`，签名公钥位于 `src-tauri/.updater/titan.key.pub`，私钥不提交。
+- 打包：`bundle.createUpdaterArtifacts` 已开启，构建时会同时生成安装包与更新签名产物。
+
+发布流程：先运行带签名环境变量的 `npm run tauri build`，再把生成的 `Titan_<version>_x64-setup.exe` 与 `.sig` 上传为 GitHub Release，并同步更新 `update/latest.json` 后推送。`plugins.updater.endpoints` 指向该 manifest 的 GitHub raw 地址，更新包使用同一把私钥签名。
 
 ## 本地开发
 

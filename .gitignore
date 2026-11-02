@@ -37,3 +37,10 @@ scripts/_build_toolcheck/
 scripts/_probe_env.py
 scripts/_run_toolcheck.bat
 scripts/debug_broad_diff.py
+
+# Updater signing keys (keep the public key committed)
+src-tauri/.updater/titan.key
+
+# Diagnostic scratch outputs
+/_diag_*
+scripts/_diag_*.py

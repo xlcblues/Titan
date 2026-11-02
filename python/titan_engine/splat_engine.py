@@ -15,6 +15,274 @@ def _logit(value: np.ndarray) -> np.ndarray:
     return np.log(value / (1.0 - value))
 
 
+def _nearest_surface_scale_targets(
+    positions: np.ndarray,
+    surface_points: np.ndarray,
+    multiplier: float = 0.8,
+    floor: float = 1e-4,
+) -> np.ndarray:
+    """Per-point scale targets from local surface spacing."""
+    positions = np.asarray(positions, dtype=np.float32).reshape(-1, 3)
+    if len(positions) == 0:
+        return np.zeros(0, dtype=np.float32)
+    if len(surface_points) == 0:
+        return np.full(len(positions), floor, dtype=np.float32)
+    try:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(np.asarray(surface_points, dtype=np.float32))
+        distances, _ = tree.query(positions, k=1)
+    except Exception:
+        distances = np.full(len(positions), 1.0, dtype=np.float32)
+    distances = np.asarray(distances, dtype=np.float32).reshape(-1)
+    return np.maximum(distances * max(multiplier, 1e-3), floor).astype(
+        np.float32
+    )
+
+
+def _surface_neighbor_distances(
+    positions: np.ndarray,
+    surface_points: np.ndarray,
+) -> np.ndarray:
+    """Nearest sparse-surface distance for every facet center."""
+    positions = np.asarray(positions, dtype=np.float32).reshape(-1, 3)
+    if len(positions) == 0 or len(surface_points) == 0:
+        return np.zeros(len(positions), dtype=np.float32)
+    try:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(np.asarray(surface_points, dtype=np.float32))
+        distances, _ = tree.query(positions, k=1)
+        return np.asarray(distances, dtype=np.float32).reshape(-1)
+    except Exception:
+        return np.zeros(len(positions), dtype=np.float32)
+
+
+def _surface_far_band(
+    surface_points: np.ndarray,
+    init_scale: float,
+    band_factor: float = 1.25,
+    min_dist_factor: float = 3.0,
+) -> float:
+    """Band beyond which a facet is treated as a floating shell/fog point."""
+    surface = np.asarray(surface_points, dtype=np.float32)
+    if len(surface) == 0:
+        return max(float(init_scale) * min_dist_factor, 1e-4)
+    try:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(surface)
+        surface_dist, _ = tree.query(surface, k=2)
+        spacing_p95 = float(np.quantile(surface_dist[:, 1], 0.95))
+    except Exception:
+        spacing_p95 = max(float(init_scale), 1e-4)
+    return max(
+        spacing_p95 * max(float(band_factor), 1.0),
+        max(float(init_scale), 1e-4) * max(float(min_dist_factor), 1.0),
+    )
+
+
+def _surface_far_mask(
+    positions: np.ndarray,
+    surface_points: np.ndarray,
+    band: float,
+) -> np.ndarray:
+    """Boolean mask for facets outside the sparse-surface band."""
+    distances = _surface_neighbor_distances(positions, surface_points)
+    return distances > max(float(band), 1e-4)
+
+
+def _prune_far_surface_splats(
+    model: "SplatFacetField",
+    surface_points: np.ndarray,
+    band: float,
+    device: torch.device,
+    opacity_threshold: float = 0.12,
+    max_ratio: float = 0.6,
+    keep_min_fraction: float = 0.15,
+) -> int:
+    """Drop low-opacity facets far outside the sparse-surface band.
+
+    Soft penalties leave medium-opacity fog shells in the scene. Removing
+    the faintest far facets periodically lets later densification and hole
+    filling rebuild only the surface that is actually visible.
+    """
+    if (
+        int(model.positions.shape[0]) == 0
+        or len(surface_points) == 0
+    ):
+        return 0
+    with torch.no_grad():
+        far_mask = _surface_far_mask(
+            model.positions.detach().cpu().numpy(),
+            surface_points,
+            band,
+        )
+        far_indices = torch.nonzero(
+            torch.as_tensor(far_mask, dtype=torch.bool, device=device)
+        ).reshape(-1)
+        if far_indices.numel() == 0:
+            return 0
+        opacity = torch.sigmoid(model.opacity_logits)
+        far_opacity = opacity[far_indices]
+        candidates = far_opacity < max(float(opacity_threshold), 1e-3)
+        if not torch.any(candidates):
+            return 0
+        far_count = int(far_indices.numel())
+        keep_min = max(1, int(far_count * max(float(keep_min_fraction), 0.0)))
+        remove_limit = max(
+            0,
+            int(far_count * min(max(float(max_ratio), 0.0), 0.95)),
+        )
+        candidate_indices = torch.nonzero(candidates).reshape(-1)
+        remove_indices = candidate_indices[
+            torch.argsort(far_opacity[candidate_indices])
+        ][:remove_limit]
+        if far_count - int(remove_indices.numel()) < keep_min:
+            keep_order = torch.argsort(far_opacity, descending=True)[:keep_min]
+            remove_mask = torch.ones(
+                far_count, dtype=torch.bool, device=device
+            )
+            remove_mask[keep_order] = False
+            remove_indices = torch.nonzero(remove_mask).reshape(-1)
+        if remove_indices.numel() == 0:
+            return 0
+        keep_mask = torch.ones(
+            model.positions.shape[0], dtype=torch.bool, device=device
+        )
+        keep_mask[far_indices[remove_indices]] = False
+        keep_sorted, _ = torch.sort(torch.nonzero(keep_mask).reshape(-1))
+        model.positions = torch.nn.Parameter(
+            model.positions.detach()[keep_sorted]
+        )
+        model.log_scales = torch.nn.Parameter(
+            model.log_scales.detach()[keep_sorted]
+        )
+        model.opacity_logits = torch.nn.Parameter(
+            model.opacity_logits.detach()[keep_sorted]
+        )
+        model.color_logits = torch.nn.Parameter(
+            model.color_logits.detach()[keep_sorted]
+        )
+        return int(remove_indices.numel())
+
+
+def _scale_targets_for_splats(
+    positions: np.ndarray,
+    surface_points: np.ndarray | None,
+    init_scale: float,
+    multiplier: float = 0.5,
+    floor_factor: float = 0.25,
+    cap_factor: float = 1.8,
+    far_scale_factor: float = 0.8,
+) -> np.ndarray:
+    """Per-splat scale priors from local surface spacing, capped tightly.
+
+    Facets far outside the sparse-surface band get a small target instead of a
+    large one, so floater blobs cannot grow into fog shells.
+    """
+    positions = np.asarray(positions, dtype=np.float32).reshape(-1, 3)
+    count = int(positions.shape[0])
+    if count == 0:
+        return np.zeros(0, dtype=np.float32)
+    init_scale = max(float(init_scale), 1e-4)
+    if surface_points is not None and len(surface_points) > 0:
+        base = _nearest_surface_scale_targets(
+            positions,
+            np.asarray(surface_points, dtype=np.float32),
+            multiplier=multiplier,
+            floor=init_scale * floor_factor,
+        )
+        surface = np.asarray(surface_points, dtype=np.float32)
+        try:
+            from scipy.spatial import cKDTree
+
+            surface_tree = cKDTree(surface)
+            surface_dist, _ = surface_tree.query(surface, k=2)
+            spacing_p95 = float(np.quantile(surface_dist[:, 1], 0.95))
+        except Exception:
+            spacing_p95 = float(np.median(base))
+        band = max(spacing_p95 * 1.25, init_scale * 3.0)
+        distances = _surface_neighbor_distances(positions, surface)
+        base[distances > band] = init_scale * max(far_scale_factor, 0.3)
+    else:
+        base = np.full(count, max(init_scale * 0.5, 1e-4), dtype=np.float32)
+    cap = max(init_scale * cap_factor, float(np.median(base)) * 1.5)
+    return np.minimum(base, cap).astype(np.float32)
+
+
+def _ssim_loss(
+    rendered: torch.Tensor,
+    target: torch.Tensor,
+    window_size: int = 11,
+    c1: float = 0.01,
+    c2: float = 0.03,
+) -> torch.Tensor:
+    """Differentiable 1 - SSIM for small local image windows."""
+    rendered = rendered.permute(2, 0, 1).unsqueeze(0).contiguous()
+    target = target.permute(2, 0, 1).unsqueeze(0).contiguous()
+    window_size = max(3, int(window_size))
+    sigma = 1.5
+    xs = torch.arange(window_size, dtype=torch.float32, device=rendered.device)
+    gaussian = torch.exp(-((xs - window_size // 2) ** 2) / (2.0 * sigma * sigma))
+    gaussian = gaussian / gaussian.sum()
+    kernel = torch.outer(gaussian, gaussian)
+    kernel = kernel / kernel.sum()
+    weight = kernel.view(1, 1, window_size, window_size).repeat(3, 1, 1, 1)
+    pad = window_size // 2
+
+    def conv(image: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.conv2d(
+            image,
+            weight,
+            groups=3,
+            padding=pad,
+        )
+
+    mean_x = conv(rendered)
+    mean_y = conv(target)
+    mean_xy = mean_x * mean_y
+    var_x = torch.clamp(conv(rendered * rendered) - mean_x * mean_x, min=0.0)
+    var_y = torch.clamp(conv(target * target) - mean_y * mean_y, min=0.0)
+    cov_xy = conv(rendered * target) - mean_xy
+    ssim_map = ((2.0 * mean_xy + c1) * (2.0 * cov_xy + c2)) / (
+        (mean_x * mean_x + mean_y * mean_y + c1)
+        * (var_x + var_y + c2)
+    )
+    return 1.0 - ssim_map.mean()
+
+
+def _gradient_loss(
+    rendered: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Penalize Sobel gradient differences so edges stay crisp."""
+    rendered = rendered.permute(2, 0, 1).unsqueeze(0).contiguous()
+    target = target.permute(2, 0, 1).unsqueeze(0).contiguous()
+    kernel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        dtype=torch.float32,
+        device=rendered.device,
+    ).view(1, 1, 3, 3).repeat(3, 1, 1, 1)
+    kernel_y = kernel_x.transpose(2, 3).contiguous()
+    gradient_x_r = torch.nn.functional.conv2d(
+        rendered, kernel_x, groups=3, padding=1
+    )
+    gradient_y_r = torch.nn.functional.conv2d(
+        rendered, kernel_y, groups=3, padding=1
+    )
+    gradient_x_t = torch.nn.functional.conv2d(
+        target, kernel_x, groups=3, padding=1
+    )
+    gradient_y_t = torch.nn.functional.conv2d(
+        target, kernel_y, groups=3, padding=1
+    )
+    return torch.mean(
+        (gradient_x_r - gradient_x_t) ** 2
+        + (gradient_y_r - gradient_y_t) ** 2
+    )
+
+
 def _estimate_point_scales(
     points: np.ndarray,
     global_scale: float,
@@ -42,7 +310,9 @@ def _estimate_point_scales(
         neighbor = np.min(
             np.sqrt(np.sum(diff * diff, axis=-1)) + 1e-8, axis=1
         )
-    scales = np.clip(neighbor * multiplier, 1e-4, max(global_scale, 1e-3))
+    min_scale = max(global_scale * 0.5, 1e-4)
+    max_scale = max(global_scale * 3.0, 1e-3)
+    scales = np.clip(neighbor * multiplier, min_scale, max_scale)
     return scales.astype(np.float32)
 
 
@@ -134,6 +404,146 @@ def _lowres_camera(camera: dict, low_res: int) -> dict:
         ],
         "c2w": camera["c2w"],
     }
+
+
+def _aspect_lowres_camera(camera: dict, max_pixels: int = 96) -> dict:
+    """Scale a camera down while preserving the source aspect ratio."""
+    width = int(camera["width"])
+    height = int(camera["height"])
+    factor = max_pixels / max(width, height, 1)
+    low_width = max(2, int(round(width * factor)))
+    low_height = max(2, int(round(height * factor)))
+    k = camera["K"]
+    return {
+        "path": camera.get("path", ""),
+        "width": low_width,
+        "height": low_height,
+        "K": [
+            [float(k[0][0]) * factor, 0.0, float(k[0][2]) * factor],
+            [0.0, float(k[1][1]) * factor, float(k[1][2]) * factor],
+            [0.0, 0.0, 1.0],
+        ],
+        "c2w": camera["c2w"],
+    }
+
+
+def _build_ray_coverage_points(
+    points: np.ndarray,
+    colors: np.ndarray | None,
+    cameras: list[dict],
+    count: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Add ray-aligned points so every camera frustum has initial coverage."""
+    count = max(0, int(count))
+    if count == 0 or len(cameras) == 0:
+        return points, colors
+    origins = np.asarray(
+        [
+            np.asarray(camera["c2w"], dtype=np.float32)[:3, 3]
+            for camera in cameras
+        ],
+        dtype=np.float32,
+    )
+    if len(points) > 0:
+        distances = np.linalg.norm(
+            points[:, None, :] - origins[None, :, :], axis=2
+        )
+        depth_scale = float(np.median(distances))
+    else:
+        centroid = np.mean(origins, axis=0)
+        depth_scale = float(
+            np.median(np.linalg.norm(origins - centroid[None, :], axis=1))
+        )
+    if not np.isfinite(depth_scale) or depth_scale <= 1e-4:
+        depth_scale = 1.0
+    per_camera = max(4, int(math.ceil(count / len(cameras))))
+    grid = max(4, int(math.ceil(math.sqrt(per_camera))))
+    depth_bins = np.asarray([0.8, 0.95, 1.12, 1.3], dtype=np.float32)
+    new_points: list[np.ndarray] = []
+    for camera in cameras:
+        c2w = np.asarray(camera["c2w"], dtype=np.float32)
+        origin = c2w[:3, 3]
+        rotation = c2w[:3, :3]
+        k = camera["K"]
+        width, height = camera["width"], camera["height"]
+        fx, fy, cx, cy = (
+            float(k[0][0]),
+            float(k[1][1]),
+            float(k[0][2]),
+            float(k[1][2]),
+        )
+        projected = None
+        if len(points) > 0:
+            rel = points - origin[None, :]
+            camera_space = rel @ rotation
+            zs = camera_space[:, 2]
+            safe_z = np.maximum(zs, 1e-4)
+            us = fx * camera_space[:, 0] / safe_z + cx
+            vs = fy * camera_space[:, 1] / safe_z + cy
+            visible = (
+                (zs > 1e-3)
+                & (us >= 0.0)
+                & (us < width)
+                & (vs >= 0.0)
+                & (vs < height)
+            )
+            if np.any(visible):
+                projected = (
+                    us[visible],
+                    vs[visible],
+                    zs[visible],
+                )
+        cell_count = min(per_camera, grid * grid)
+        for index in range(cell_count):
+            row, col = divmod(index, grid)
+            cell_w = width / grid
+            cell_h = height / grid
+            u = float(np.clip((col + 0.5) * cell_w + rng.uniform(-0.25, 0.25) * cell_w, 0.0, width - 1))
+            v = float(np.clip((row + 0.5) * cell_h + rng.uniform(-0.25, 0.25) * cell_h, 0.0, height - 1))
+            if projected is not None:
+                du = projected[0] - u
+                dv = projected[1] - v
+                search = max(cell_w, cell_h) * 0.9
+                local = du * du + dv * dv < search * search
+                if np.any(local):
+                    depth = float(np.median(projected[2][local])) * rng.uniform(
+                        0.88, 1.14
+                    )
+                else:
+                    nearest = int(np.argmin(du * du + dv * dv))
+                    if (
+                        du[nearest] * du[nearest] + dv[nearest] * dv[nearest]
+                        < 6.25 * search * search
+                    ):
+                        depth = float(projected[2][nearest]) * rng.uniform(
+                            0.88, 1.14
+                        )
+                    else:
+                        depth = depth_scale * float(
+                            depth_bins[index % len(depth_bins)]
+                            * rng.uniform(0.9, 1.1)
+                        )
+            else:
+                depth = depth_scale * float(
+                    depth_bins[index % len(depth_bins)] * rng.uniform(0.9, 1.1)
+                )
+            cam_x = (u - cx) / fx * depth
+            cam_y = (v - cy) / fy * depth
+            world = origin + np.asarray([cam_x, cam_y, depth], dtype=np.float32) @ rotation.T
+            new_points.append(world)
+    if not new_points:
+        return points, colors
+    new_points_array = np.asarray(new_points, dtype=np.float32)[:count]
+    merged_points = (
+        points if len(points) else np.empty((0, 3), dtype=np.float32)
+    )
+    merged_points = np.concatenate([merged_points, new_points_array], axis=0)
+    if colors is None:
+        return merged_points, None
+    new_colors = np.zeros((len(new_points_array), 3), dtype=np.float32)
+    merged_colors = np.concatenate([colors, new_colors], axis=0)
+    return merged_points, merged_colors
 
 
 def _downsample_images(
@@ -232,7 +642,9 @@ def _render_pixels_dense(
             from .main import ray_bounds_from_points
 
             bounds = ray_bounds_from_points(
-                origin.cpu().detach().numpy(), scene_points
+                origin.cpu().detach().numpy(),
+                scene_points,
+                rotation=rotation.cpu().detach().numpy(),
             )
         else:
             depths = torch.linalg.norm(
@@ -500,7 +912,9 @@ def _render_pixels_tile(
             from .main import ray_bounds_from_points
 
             bounds = ray_bounds_from_points(
-                origin.cpu().detach().numpy(), scene_points
+                origin.cpu().detach().numpy(),
+                scene_points,
+                rotation=rotation.cpu().detach().numpy(),
             )
         else:
             depths = torch.linalg.norm(
@@ -983,7 +1397,9 @@ def _render_pixels_cuda(
             from .main import ray_bounds_from_points
 
             bounds = ray_bounds_from_points(
-                origin.cpu().detach().numpy(), scene_points
+                origin.cpu().detach().numpy(),
+                scene_points,
+                rotation=rotation.cpu().detach().numpy(),
             )
         else:
             depths = torch.linalg.norm(
@@ -1199,22 +1615,28 @@ def _density_prior_loss(
     device: torch.device,
     rng: np.random.Generator,
     count: int = 1024,
+    margin: float | None = None,
 ):
-    """Keep facets near the observed surface instead of drifting into haze."""
+    """Keep facets inside the observed scene volume instead of drifting far."""
     if len(surface_points) == 0 or model.positions.numel() == 0:
         return torch.zeros((), dtype=torch.float32, device=device)
     position_count = model.positions.shape[0]
     position_indices = rng.integers(0, position_count, size=count)
     positions = model.positions[position_indices]
-    surface_count = min(len(surface_points), 2048)
-    surface = surface_points[
-        rng.integers(0, len(surface_points), size=surface_count)
-    ]
-    target = torch.as_tensor(surface, dtype=torch.float32, device=device)
-    diff = positions[:, None, :] - target[None, :, :]
-    distance = torch.sqrt(torch.sum(diff * diff, dim=-1) + 1e-8)
-    nearest = torch.min(distance, dim=1).values
-    return torch.mean(nearest * nearest)
+    lower = np.quantile(surface_points, 0.03, axis=0)
+    upper = np.quantile(surface_points, 0.97, axis=0)
+    if margin is None:
+        span = float(np.mean(upper - lower))
+        margin = max(span * 0.05, 1e-3)
+    lower_t = torch.as_tensor(
+        lower - margin, dtype=torch.float32, device=device
+    )
+    upper_t = torch.as_tensor(
+        upper + margin, dtype=torch.float32, device=device
+    )
+    below = torch.clamp(lower_t[None, :] - positions, min=0.0)
+    above = torch.clamp(positions - upper_t[None, :], min=0.0)
+    return torch.mean(below * below + above * above)
 
 
 def color_points_from_images(
@@ -1338,19 +1760,152 @@ def _opacity_reset(
     opacity: float,
     near: float,
     far: float,
+    exclude_mask: torch.Tensor | None = None,
 ) -> None:
-    """Re-raise opacity for visible facets so haze cannot persist."""
+    """Raise only faded visible facets so haze cannot persist without shells."""
     visible = _visible_mask(
         model, camera, surface_points, device, near, far
     )
+    if exclude_mask is not None:
+        visible = visible & (~exclude_mask)
     if not torch.any(visible):
         return
     with torch.no_grad():
-        model.opacity_logits[visible] = torch.as_tensor(
-            [math.log(opacity / (1.0 - opacity))],
-            dtype=torch.float32,
-            device=device,
+        faded = visible & (torch.sigmoid(model.opacity_logits) < opacity)
+        if torch.any(faded):
+            model.opacity_logits[faded] = torch.as_tensor(
+                [math.log(opacity / (1.0 - opacity))],
+                dtype=torch.float32,
+                device=device,
+            )
+
+
+def _prune_splats_to_budget(
+    model: SplatFacetField,
+    target_count: int,
+    device: torch.device,
+    min_opacity: float = 0.12,
+) -> int:
+    """Drop low-opacity facets when VRAM pressure forces a smaller budget."""
+    target_count = max(0, int(target_count))
+    current = int(model.positions.shape[0])
+    if target_count >= current:
+        return current
+    with torch.no_grad():
+        opacity = torch.sigmoid(model.opacity_logits)
+        keep = torch.nonzero(opacity >= min_opacity).reshape(-1)
+        if keep.numel() > target_count:
+            order = torch.argsort(opacity[keep], descending=True)[:target_count]
+            keep = keep[order]
+        keep_sorted, _ = torch.sort(keep)
+        model.positions = torch.nn.Parameter(
+            model.positions.detach()[keep_sorted]
         )
+        model.log_scales = torch.nn.Parameter(
+            model.log_scales.detach()[keep_sorted]
+        )
+        model.opacity_logits = torch.nn.Parameter(
+            model.opacity_logits.detach()[keep_sorted]
+        )
+        model.color_logits = torch.nn.Parameter(
+            model.color_logits.detach()[keep_sorted]
+        )
+    return int(model.positions.shape[0])
+
+
+def _vram_budget_update(
+    config: dict,
+    device: torch.device,
+    scene_cap: int,
+    current_cap: int,
+    tile_pair_budget: int,
+    tile_work_budget: int,
+    tile_max_splats: int,
+) -> tuple[int, int, int, int, int, float, float]:
+    """Tighten toward VRAM headroom only when memory pressure appears."""
+    adaptive = bool(config.get("adaptive_budget", True))
+    if not adaptive or not torch.cuda.is_available():
+        return (
+            current_cap,
+            tile_pair_budget,
+            tile_work_budget,
+            tile_max_splats,
+            0,
+            0.0,
+            0.0,
+        )
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    except Exception:
+        return (
+            current_cap,
+            tile_pair_budget,
+            tile_work_budget,
+            tile_max_splats,
+            0,
+            0.0,
+            0.0,
+        )
+    free_mb = free_bytes / (1024 * 1024)
+    total_mb = total_bytes / (1024 * 1024)
+    headroom_mb = min(
+        float(config.get("vram_headroom_mb", 1200)),
+        max(256.0, total_mb * 0.5),
+    )
+    usable_mb = max(0.0, free_mb - headroom_mb)
+    splat_mb = max(1e-4, float(config.get("splat_mb_estimate", 0.012)))
+    min_cap = min(
+        scene_cap,
+        max(1000, int(config.get("adaptive_min_splats", 30000))),
+    )
+    target_cap = int(usable_mb / splat_mb)
+    target_cap = max(min_cap, min(target_cap, scene_cap))
+    pressure = 0
+    critical_mb = float(config.get("vram_critical_mb", 1400))
+    low_mb = float(config.get("vram_low_mb", 2200))
+    if free_mb < critical_mb:
+        pressure = 2
+    elif free_mb < low_mb:
+        pressure = 1
+    if pressure == 0:
+        updated_cap = scene_cap
+    else:
+        if current_cap > 0:
+            smoothed = int(current_cap * 0.7 + target_cap * 0.3)
+        else:
+            smoothed = target_cap
+        updated_cap = max(min_cap, min(smoothed, scene_cap))
+    if pressure >= 1:
+        tile_pair_budget = min(
+            tile_pair_budget,
+            int(config.get("vram_tight_tile_pair_budget", 2_000_000)),
+        )
+        tile_work_budget = min(
+            tile_work_budget,
+            int(config.get("vram_tight_tile_work_budget", 12_000_000)),
+        )
+        tile_max_splats = min(
+            tile_max_splats,
+            int(config.get("vram_tight_tile_max_splats", 4096)),
+        )
+    if pressure >= 2:
+        tile_pair_budget = min(
+            tile_pair_budget,
+            int(config.get("vram_critical_tile_pair_budget", 1_200_000)),
+        )
+        tile_max_splats = min(
+            tile_max_splats,
+            int(config.get("vram_critical_tile_max_splats", 3072)),
+        )
+    return (
+        updated_cap,
+        tile_pair_budget,
+        tile_work_budget,
+        tile_max_splats,
+        pressure,
+        free_mb,
+        total_mb,
+    )
 
 
 def _densify_and_prune(
@@ -1374,7 +1929,7 @@ def _densify_and_prune(
             model, camera, surface_points, device, near, far
         )
         strength = grad_accum * visible
-        threshold = float(torch.quantile(strength, 0.72).item()) if torch.any(strength > 0) else 0.0
+        threshold = float(torch.quantile(strength, 0.85).item()) if torch.any(strength > 0) else 0.0
         candidates = torch.nonzero(
             (strength >= threshold) & (strength > 0) & keep
         ).reshape(-1)
@@ -1397,14 +1952,14 @@ def _densify_and_prune(
         new_log_scales = torch.cat(
             [
                 model.log_scales.detach(),
-                (torch.log(parent_scale * 0.65)).detach(),
+                (torch.log(parent_scale * 0.6)).detach(),
             ],
             dim=0,
         )
         new_opacity = torch.cat(
             [
                 model.opacity_logits.detach(),
-                math.log(0.9 / (1.0 - 0.9))
+                math.log(0.45 / (1.0 - 0.45))
                 + 0.2 * torch.randn(count, device=device),
             ],
             dim=0,
@@ -1432,6 +1987,356 @@ def _densify_and_prune(
         model.opacity_logits = torch.nn.Parameter(keep_opacity)
         model.color_logits = torch.nn.Parameter(keep_colors)
         return True
+
+
+def _split_large_splats(
+    model: SplatFacetField,
+    camera: dict,
+    device: torch.device,
+    max_splats: int,
+    near: float,
+    far: float,
+    rng: np.random.Generator,
+    split_scale_factor: float = 0.55,
+    min_split_scale_px: float = 2.4,
+    max_splits: int = 3000,
+    children_per_split: int = 4,
+    shrink_factor: float = 0.85,
+) -> tuple[int, bool]:
+    """Replace oversized visible facets with smaller copies.
+
+    When the splat budget is exhausted the largest facets are shrunk in place
+    instead, which still removes the blob-like footprint without extra VRAM.
+    """
+    if int(model.positions.shape[0]) == 0:
+        return (0, False)
+    with torch.no_grad():
+        rotation, origin, fx, _, _, _, _, _ = _camera_geometry(camera, device)
+        _, _, _, z, visible = _project_points(
+            model.positions,
+            rotation,
+            origin,
+            fx,
+            fx,
+            0.0,
+            0.0,
+            1,
+            1,
+            near,
+        )
+        visible = visible[:, 0] & (z[:, 0] < far)
+        opacity = torch.sigmoid(model.opacity_logits)
+        visible = visible & (opacity >= 0.02)
+        projected_sigma = (
+            torch.exp(model.log_scales) * fx / torch.clamp(z[:, 0], min=1e-4)
+        )
+        candidates = torch.nonzero(
+            visible & (projected_sigma > min_split_scale_px)
+        ).reshape(-1)
+        if candidates.numel() == 0:
+            return (0, False)
+        order = torch.argsort(projected_sigma[candidates], descending=True)
+        count_limit = min(int(candidates.numel()), max(0, int(max_splits)))
+        chosen = candidates[order[:count_limit]]
+        budget = max(0, max_splats - int(model.positions.shape[0]))
+        children_per_split = max(2, int(children_per_split))
+        max_splits_by_budget = (
+            budget // (children_per_split - 1) if children_per_split > 1 else 0
+        )
+        split_count = min(int(chosen.numel()), max_splits_by_budget)
+        if split_count <= 0:
+            shrink_targets = chosen[
+                : max(1, int(model.positions.shape[0]) // 20)
+            ]
+            if shrink_targets.numel() > 0:
+                model.log_scales[shrink_targets] = torch.log(
+                    torch.clamp(
+                        torch.exp(model.log_scales[shrink_targets])
+                        * max(float(shrink_factor), 0.5),
+                        min=1e-4,
+                    )
+                )
+                return (0, True)
+            return (0, False)
+        chosen = chosen[:split_count]
+        parent_scale = torch.exp(model.log_scales[chosen])
+        child_scale = torch.clamp(
+            parent_scale * max(float(split_scale_factor), 0.3),
+            min=1e-4,
+        )
+        offsets = torch.tensor(
+            [
+                [-0.6, 0.0],
+                [0.6, 0.0],
+                [0.0, -0.6],
+                [0.0, 0.6],
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        axis_x = rotation[:, 0]
+        axis_y = rotation[:, 1]
+        delta = (
+            offsets[:, 0:1] * axis_x[None, :]
+            + offsets[:, 1:2] * axis_y[None, :]
+        )
+        delta = delta[:, None, :] * child_scale[None, :, None]
+        child_positions = (
+            model.positions[chosen][None, :, :] + delta
+        ).reshape(-1, 3)
+        child_log_scales = torch.log(
+            child_scale[:, None].repeat(1, children_per_split).reshape(-1)
+        )
+        parent_opacity = torch.sigmoid(model.opacity_logits[chosen])
+        child_opacity = torch.clamp(parent_opacity * 0.55, min=0.02, max=0.85)
+        child_opacity_logits = torch.log(
+            child_opacity / torch.clamp(1.0 - child_opacity, min=1e-4)
+        )
+        child_opacity_logits = (
+            child_opacity_logits[:, None].repeat(1, children_per_split).reshape(-1)
+        )
+        child_colors = model.color_logits[chosen].repeat_interleave(
+            children_per_split, dim=0
+        )
+        keep_mask = torch.ones(
+            model.positions.shape[0], dtype=torch.bool, device=device
+        )
+        keep_mask[chosen] = False
+        model.positions = torch.nn.Parameter(
+            torch.cat(
+                [model.positions.detach()[keep_mask], child_positions.detach()],
+                dim=0,
+            )
+        )
+        model.log_scales = torch.nn.Parameter(
+            torch.cat(
+                [model.log_scales.detach()[keep_mask], child_log_scales.detach()],
+                dim=0,
+            )
+        )
+        model.opacity_logits = torch.nn.Parameter(
+            torch.cat(
+                [
+                    model.opacity_logits.detach()[keep_mask],
+                    child_opacity_logits.detach(),
+                ],
+                dim=0,
+            )
+        )
+        model.color_logits = torch.nn.Parameter(
+            torch.cat(
+                [model.color_logits.detach()[keep_mask], child_colors.detach()],
+                dim=0,
+            )
+        )
+        return (split_count, True)
+
+
+def _hole_fill_splats(
+    model: SplatFacetField,
+    camera: dict,
+    target_image: np.ndarray,
+    background: np.ndarray,
+    near: float,
+    far: float,
+    device: torch.device,
+    rng: np.random.Generator,
+    max_add: int,
+    low_res: int = 96,
+    scale_floor: float = 1e-3,
+    scale_ceiling: float = 0.4,
+    tile_pair_budget: int = 4_000_000,
+    tile_max_splats: int = 8192,
+    tile_work_budget: int = 2_000_000,
+    use_cuda_tile: bool = True,
+    scale_px_factor: float = 1.2,
+    median_scale_factor: float = 0.55,
+    scale_ceiling_factor: float = 1.4,
+    opacity_center: float = 0.3,
+    depth_ratios: tuple[float, ...] = (0.90, 1.00, 1.10),
+    disk_cutoff: float = 1.8,
+    falloff_power: float = 1.0,
+) -> tuple[bool, int]:
+    """Backproject unresolved pixels into new facets along multiple depths."""
+    from PIL import Image
+
+    max_add = max(0, int(max_add))
+    if max_add == 0 or model.positions.numel() == 0:
+        return (False, 0)
+    depth_ratios = tuple(
+        float(value) for value in (depth_ratios or (1.0,))
+    )
+    depth_per_hole = max(1, len(depth_ratios))
+    with torch.no_grad():
+        low_camera = _aspect_lowres_camera(camera, max_pixels=low_res)
+        low_width = int(low_camera["width"])
+        low_height = int(low_camera["height"])
+        bg_tensor = torch.as_tensor(
+            background, dtype=torch.float32, device=device
+        )
+        rendered = _render_pixels(
+            model,
+            low_camera,
+            None,
+            low_width,
+            low_height,
+            bg_tensor,
+            near=near,
+            far=far,
+            batch_size=256,
+            disk_cutoff=disk_cutoff,
+            falloff_power=falloff_power,
+            tile_size=16,
+            dense_renderer=False,
+            tile_pair_budget=tile_pair_budget,
+            tile_max_splats=tile_max_splats,
+            tile_work_budget=tile_work_budget,
+            use_cuda_tile=use_cuda_tile,
+        )
+        render_low = (
+            rendered.detach().cpu().numpy().reshape(low_height, low_width, 3)
+        )
+        target_low = np.asarray(
+            Image.fromarray(
+                np.clip(target_image * 255.0, 0.0, 255.0).astype(np.uint8)
+            ).resize((low_width, low_height), Image.LANCZOS),
+            dtype=np.float32,
+        ) / 255.0
+        bg = np.asarray(background, dtype=np.float32)
+        near_bg = np.mean(np.abs(render_low - bg), axis=-1) < 0.08
+        has_target = np.mean(np.abs(target_low - bg), axis=-1) > 0.06
+        bad_fit = np.mean(np.abs(render_low - target_low), axis=-1) > 0.22
+        hole_mask = near_bg & has_target
+        padded = np.pad(hole_mask, 1, mode="edge")
+        dilated = np.zeros_like(hole_mask)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                dilated |= padded[
+                    1 + dy : 1 + dy + low_height,
+                    1 + dx : 1 + dx + low_width,
+                ]
+        hole_mask = dilated | (bad_fit & has_target & ~near_bg)
+        hole_count = int(hole_mask.sum())
+        raw_hole_count = hole_count
+        if hole_count == 0:
+            return (False, 0)
+        hole_count = min(hole_count, max_add // depth_per_hole)
+        if hole_count == 0:
+            return (False, raw_hole_count)
+        ys, xs = np.nonzero(hole_mask)
+        chosen = rng.choice(len(ys), size=hole_count, replace=False)
+        ys = ys[chosen].astype(np.int64)
+        xs = xs[chosen].astype(np.int64)
+
+        c2w = np.asarray(camera["c2w"], dtype=np.float32)
+        origin = c2w[:3, 3]
+        rotation = c2w[:3, :3]
+        k = low_camera["K"]
+        fx_lr = float(k[0][0])
+        fy_lr = float(k[1][1])
+        cx_lr = float(k[0][2])
+        cy_lr = float(k[1][2])
+
+        origin_t = torch.as_tensor(origin, dtype=torch.float32, device=device)
+        rotation_t = torch.as_tensor(
+            rotation, dtype=torch.float32, device=device
+        )
+        model_camera = (model.positions.detach() - origin_t[None, :]) @ rotation_t
+        model_z = model_camera[:, 2]
+        safe_model_z = torch.clamp(model_z, min=1e-4)
+        model_u = fx_lr * model_camera[:, 0] / safe_model_z + cx_lr
+        model_v = fy_lr * model_camera[:, 1] / safe_model_z + cy_lr
+        z_ok = model_z[(model_z > near) & (model_z < far)]
+        z_median = (
+            float(z_ok.median().item())
+            if z_ok.numel() > 0
+            else float(math.sqrt(max(near, 1e-4) * max(far, 1e-4)))
+        )
+        mz_np = model_z.detach().cpu().numpy()
+        mu_np = model_u.detach().cpu().numpy()
+        mv_np = model_v.detach().cpu().numpy()
+        search_radius = max(2.0, low_width * 0.015)
+        base_depths = np.empty(hole_count, dtype=np.float32)
+        for hole_index in range(hole_count):
+            du = mu_np - xs[hole_index]
+            dv = mv_np - ys[hole_index]
+            dist2 = du * du + dv * dv
+            local = (dist2 < search_radius * search_radius)
+            local &= mz_np > near
+            local &= mz_np < far
+            candidate = np.nonzero(local)[0]
+            if candidate.size:
+                nearest = candidate[int(np.argmin(dist2[candidate]))]
+                base_depths[hole_index] = float(mz_np[nearest])
+            else:
+                base_depths[hole_index] = z_median
+        depth_ratio_values = np.tile(
+            np.asarray(depth_ratios, dtype=np.float32),
+            hole_count,
+        )
+        z_values = np.clip(
+            np.repeat(base_depths, depth_per_hole) * depth_ratio_values,
+            near * 1.02,
+            far * 0.98,
+        ).astype(np.float32)
+        u_values = np.repeat((xs + 0.5).astype(np.float32), depth_per_hole)
+        v_values = np.repeat((ys + 0.5).astype(np.float32), depth_per_hole)
+        cam_x = (u_values - cx_lr) / fx_lr * z_values
+        cam_y = (v_values - cy_lr) / fy_lr * z_values
+        new_positions = origin[None, :] + np.stack(
+            [cam_x, cam_y, z_values], axis=-1
+        ) @ rotation.T
+        scales = torch.exp(model.log_scales.detach())
+        median_scale = float(scales.median().item())
+        pixel_scale = z_values / max(fx_lr, 1e-4)
+        new_scale = np.clip(
+            np.maximum(
+                pixel_scale * max(float(scale_px_factor), 0.5),
+                median_scale * max(float(median_scale_factor), 0.2),
+            ),
+            float(scale_floor),
+            min(
+                float(scale_ceiling),
+                median_scale * max(float(scale_ceiling_factor), 1.0),
+            ),
+        )
+        new_colors = np.repeat(
+            target_low[ys, xs],
+            depth_per_hole,
+            axis=0,
+        )
+        new_opacity = np.clip(
+            float(opacity_center) + 0.1 * rng.uniform(size=len(z_values)),
+            0.1,
+            0.45,
+        )
+        position_t = torch.as_tensor(
+            new_positions, dtype=torch.float32, device=device
+        )
+        color_t = torch.as_tensor(
+            _logit(new_colors), dtype=torch.float32, device=device
+        )
+        opacity_t = torch.as_tensor(
+            _logit(new_opacity), dtype=torch.float32, device=device
+        )
+        scale_t = torch.as_tensor(
+            np.log(np.clip(new_scale, 1e-4, None)),
+            dtype=torch.float32,
+            device=device,
+        )
+        model.positions = torch.nn.Parameter(
+            torch.cat([model.positions.detach(), position_t], dim=0)
+        )
+        model.log_scales = torch.nn.Parameter(
+            torch.cat([model.log_scales.detach(), scale_t], dim=0)
+        )
+        model.opacity_logits = torch.nn.Parameter(
+            torch.cat([model.opacity_logits.detach(), opacity_t], dim=0)
+        )
+        model.color_logits = torch.nn.Parameter(
+            torch.cat([model.color_logits.detach(), color_t], dim=0)
+        )
+        return (True, raw_hole_count)
 
 
 def train_tfrf_splat(
@@ -1467,6 +2372,9 @@ def train_tfrf_splat(
     tile_pair_budget = int(config.get("tile_pair_budget", 4_000_000))
     tile_work_budget = int(config.get("tile_work_budget", 2_000_000))
     tile_max_splats = int(config.get("tile_max_splats", 8192))
+    base_tile_pair_budget = tile_pair_budget
+    base_tile_work_budget = tile_work_budget
+    base_tile_max_splats = tile_max_splats
     disk_cutoff = float(config.get("disk_cutoff", 1.8))
     falloff_power = float(config.get("falloff_power", 1.0))
     train_original = bool(config.get("train_original_resolution", False))
@@ -1474,11 +2382,12 @@ def train_tfrf_splat(
     use_cuda_tile = bool(config.get("use_cuda_tile", True))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     scene_scale = scene_scale_from_cameras(cameras)
+    train_cameras = cameras[:train_count]
+    use_image_colors = bool(config.get("use_image_colors", True))
 
     if sparse_points:
         points = np.asarray(sparse_points, dtype=np.float32)[:, :3]
         colors = np.asarray(sparse_points, dtype=np.float32)[:, 3:6] / 255.0
-        use_image_colors = bool(config.get("use_image_colors", True))
         if use_image_colors and colors.size > 0 and np.mean(colors) < 0.05:
             image_colors = color_points_from_images(points, cameras, images)
             covered = int(np.sum(np.any(image_colors > 0, axis=1)))
@@ -1496,6 +2405,37 @@ def train_tfrf_splat(
             dtype=np.float32,
         )
         colors = None
+    max_splats = int(config.get("max_splats", 12000))
+    adaptive_budget = bool(config.get("adaptive_budget", True))
+    budget_check_every = max(1, int(config.get("budget_check_every", 20)))
+    current_cap = max_splats
+    scene_cap = max_splats
+    max_splats_absolute = max(
+        max_splats, int(config.get("max_splats_absolute", 150000))
+    )
+    scene_cap_boost = max(1000, int(config.get("scene_cap_boost", 10000)))
+    ray_cover_count = min(
+        int(config.get("ray_cover_points", 6000)),
+        max(0, max_splats - len(points)),
+    )
+    if ray_cover_count > 0:
+        init_rng = np.random.default_rng(11)
+        points, colors = _build_ray_coverage_points(
+            points, colors, train_cameras, ray_cover_count, init_rng
+        )
+        if use_image_colors:
+            image_colors = color_points_from_images(
+                points, train_cameras, images[: len(train_cameras)]
+            )
+            covered = np.any(image_colors > 0, axis=1)
+            if colors is None:
+                colors = np.full_like(image_colors, 0.55)
+            colors[covered] = image_colors[covered]
+            log(
+                f"[init] 射线补点 {ray_cover_count}，"
+                f"{int(np.sum(covered))} 个点从训练图采样颜色"
+            )
+        log(f"[init] 初始棱面 {len(points)} 个（含射线补点）")
     init_scale = float(config.get("init_scale", 0.0))
     if init_scale <= 0:
         init_scale = estimate_init_scale(
@@ -1514,7 +2454,7 @@ def train_tfrf_splat(
         colors,
         scale=init_scale,
         scales=point_scales,
-        opacity=float(config.get("init_opacity", 0.85)),
+        opacity=float(config.get("init_opacity", 0.45)),
     ).to(device)
 
     def build_optimizer() -> torch.optim.Adam:
@@ -1532,7 +2472,6 @@ def train_tfrf_splat(
         optimizer, T_max=steps, eta_min=learning_rate * 0.1
     )
 
-    train_cameras = cameras[:train_count]
     eval_cameras = cameras[train_count:]
     if not eval_cameras:
         eval_cameras = cameras[-1:]
@@ -1542,6 +2481,77 @@ def train_tfrf_splat(
     surface_points = (
         np.asarray(sparse_points, dtype=np.float32)[:, :3] if sparse_points else None
     )
+    surface_far_prior_weight = float(
+        config.get("surface_far_prior_weight", 0.02)
+    )
+    surface_far_opacity_cap = float(
+        config.get("surface_far_opacity_cap", 0.18)
+    )
+    surface_far_opacity_clamp = float(
+        config.get("surface_far_opacity_clamp", 0.0)
+    )
+    surface_far_prior_every = max(
+        1, int(config.get("surface_far_prior_every", 25))
+    )
+    far_prune_enabled = bool(config.get("far_prune", False))
+    far_prune_after = int(config.get("far_prune_after", 160))
+    far_prune_every = max(1, int(config.get("far_prune_every", 40)))
+    far_prune_opacity = float(config.get("far_prune_opacity", 0.15))
+    far_prune_max_ratio = float(config.get("far_prune_max_ratio", 0.6))
+    far_prune_keep_min_fraction = float(
+        config.get("far_prune_keep_min_fraction", 0.2)
+    )
+    surface_far_band = None
+    far_surface_mask = None
+    far_mask_active = False
+    if surface_points is not None and len(surface_points) > 0:
+        surface_far_band = _surface_far_band(
+            surface_points,
+            init_scale,
+            band_factor=float(config.get("surface_far_band_factor", 1.25)),
+            min_dist_factor=float(config.get("surface_far_min_dist_factor", 3.0)),
+        )
+        if surface_far_prior_weight > 0:
+            far_surface_mask = torch.as_tensor(
+                _surface_far_mask(points, surface_points, surface_far_band),
+                dtype=torch.bool,
+                device=device,
+            )
+            far_mask_active = bool(far_surface_mask.any().item())
+    scale_targets = torch.as_tensor(
+        _scale_targets_for_splats(
+            points,
+            surface_points,
+            init_scale,
+            far_scale_factor=float(config.get("far_scale_factor", 0.8)),
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    def rebuild_scale_targets() -> None:
+        nonlocal scale_targets, far_surface_mask, far_mask_active
+        positions_np = model.positions.detach().cpu().numpy()
+        scale_targets = torch.as_tensor(
+            _scale_targets_for_splats(
+                positions_np,
+                surface_points,
+                init_scale,
+                far_scale_factor=float(config.get("far_scale_factor", 0.8)),
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        if surface_far_band is not None:
+            far_surface_mask = torch.as_tensor(
+                _surface_far_mask(
+                    positions_np, surface_points, surface_far_band
+                ),
+                dtype=torch.bool,
+                device=device,
+            )
+            far_mask_active = bool(far_surface_mask.any().item())
+
     background = SCENE_BACKGROUND
     bg_tensor = torch.as_tensor(background, dtype=torch.float32, device=device)
     global_res = int(config.get("global_residual_resolution", 16))
@@ -1583,18 +2593,78 @@ def train_tfrf_splat(
     )
     history: list[dict] = []
     start_wall = time.time()
-    densify_every = int(config.get("densify_every", 50))
+    densify_every = max(1, int(config.get("densify_every", 50)))
     densify_after = int(config.get("densify_after", 80))
-    max_splats = int(config.get("max_splats", 12000))
     prune_opacity = float(config.get("prune_opacity", 0.04))
     reset_after = int(config.get("opacity_reset_after", 140))
     reset_every = int(config.get("opacity_reset_every", 100))
-    reset_opacity = float(config.get("opacity_reset_value", 0.92))
+    reset_opacity = float(config.get("opacity_reset_value", 0.7))
     scale_upper = max(
-        init_scale * float(config.get("scale_log_clamp", 2.5)), 0.2
+        init_scale * float(config.get("scale_log_clamp", 4.0)),
+        float(config.get("scale_upper_floor", 0.2)),
     )
+    ssim_loss_weight = float(config.get("ssim_loss_weight", 0.2))
+    ssim_window_size = int(config.get("ssim_window_size", 11))
+    edge_loss_weight = float(config.get("edge_loss_weight", 0.0))
+    hole_coverage_weight = float(config.get("hole_coverage_weight", 0.25))
+    projected_scale_prior_weight = float(
+        config.get("projected_scale_prior_weight", 0.015)
+    )
+    projected_scale_target_px = float(
+        config.get("projected_scale_target_px", 1.6)
+    )
+    split_large_enabled = bool(config.get("split_large_splats", True))
+    split_after = int(config.get("split_after", 200))
+    split_every = max(1, int(config.get("split_every", 50)))
+    split_scale_factor = float(config.get("split_scale_factor", 0.55))
+    split_min_scale_px = float(config.get("split_min_projected_px", 2.4))
+    split_max_per_cycle = int(config.get("split_max_per_cycle", 3000))
+    split_children = int(config.get("split_children", 4))
+    split_shrink_factor = float(config.get("split_shrink_factor", 0.85))
     densify_enabled = bool(config.get("densify", True))
+    hole_fill_enabled = bool(config.get("hole_fill", True))
+    hole_fill_after = int(config.get("hole_fill_after", 100))
+    hole_fill_every = max(1, int(config.get("hole_fill_every", 80)))
+    hole_fill_add = int(config.get("hole_fill_add", 500))
+    hole_fill_low_res = int(config.get("hole_fill_resolution", 96))
+    hole_fill_add_scene_boost = int(
+        config.get("hole_fill_add_scene_boost", 2500)
+    )
+    scene_demand_hole_min = max(
+        0, int(config.get("scene_demand_hole_min", 200))
+    )
+    prune_low_opacity = bool(config.get("prune_low_opacity", True))
+    prune_opacity_every = max(1, int(config.get("prune_opacity_every", 80)))
+    prune_opacity_threshold = float(
+        config.get("prune_opacity_threshold", 0.03)
+    )
+    prune_opacity_keep_ratio = float(
+        config.get("prune_opacity_keep_ratio", 0.75)
+    )
     grad_accum = torch.zeros(len(points), dtype=torch.float32, device=device)
+    (
+        current_cap,
+        tile_pair_budget,
+        tile_work_budget,
+        tile_max_splats,
+        vram_pressure,
+        vram_free_mb,
+        vram_total_mb,
+    ) = _vram_budget_update(
+        config,
+        device,
+        scene_cap,
+        current_cap,
+        base_tile_pair_budget,
+        base_tile_work_budget,
+        base_tile_max_splats,
+    )
+    if adaptive_budget and vram_total_mb > 0:
+        log(
+            f"[vram] 显存 {vram_free_mb:.0f}/{vram_total_mb:.0f} MiB，"
+            f"初始棱面上限 {current_cap}"
+        )
+    last_raw_holes = 0
 
     def accumulate_gradients(current: torch.Tensor | None) -> None:
         if current is None:
@@ -1612,7 +2682,7 @@ def train_tfrf_splat(
         k = camera["K"]
         fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
         near, far = ray_bounds_from_points(
-            c2w[:3, 3], surface_points
+            c2w[:3, 3], surface_points, rotation=c2w[:3, :3]
         ) if surface_points is not None and len(surface_points) else (0.3, 7.6)
         rng = np.random.default_rng(step)
         if train_original:
@@ -1657,29 +2727,77 @@ def train_tfrf_splat(
                 device=device,
             )
         loss = torch.mean((rendered - target) ** 2)
+        if train_original and ssim_loss_weight > 0:
+            ssim_term = _ssim_loss(
+                rendered.reshape(height, width, 3),
+                target.reshape(height, width, 3),
+                window_size=ssim_window_size,
+            )
+            loss = loss + ssim_loss_weight * ssim_term
+        if train_original and hole_coverage_weight > 0:
+            rendered_img = rendered.reshape(height, width, 3)
+            target_img = target.reshape(height, width, 3)
+            target_content = (
+                torch.mean(torch.abs(target_img - bg_tensor), dim=-1)
+                > float(config.get("hole_target_tol", 0.06))
+            )
+            render_bg = (
+                torch.mean(torch.abs(rendered_img - bg_tensor), dim=-1)
+                < float(config.get("hole_bg_tol", 0.10))
+            )
+            hole_mask = target_content & render_bg
+            if bool(hole_mask.any()):
+                hole_loss = torch.mean(
+                    ((target_img - rendered_img) ** 2)
+                    * hole_mask.unsqueeze(-1)
+                )
+                loss = loss + hole_coverage_weight * hole_loss
+        if train_original and edge_loss_weight > 0:
+            loss = loss + edge_loss_weight * _gradient_loss(
+                rendered.reshape(height, width, 3),
+                target.reshape(height, width, 3),
+            )
         if surface_points is not None:
             prior_rng = np.random.default_rng(step + 50_000)
-            prior_weight = float(config.get("surface_prior_weight", 0.05))
+            prior_weight = float(config.get("surface_prior_weight", 0.015))
             loss = loss + prior_weight * _density_prior_loss(
                 model, surface_points, device, prior_rng
             )
-        scale_target_count = min(
-            model.positions.shape[0], point_scales.shape[0]
-        )
-        scale_loss = float(config.get("scale_prior_weight", 0.03)) * torch.mean(
-            (
-                model.log_scales[:scale_target_count]
-                - torch.log(
-                    torch.as_tensor(
-                        point_scales[:scale_target_count],
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                )
+        if (
+            surface_far_prior_weight > 0
+            and far_mask_active
+            and far_surface_mask is not None
+        ):
+            far_opac = torch.sigmoid(
+                model.opacity_logits[far_surface_mask]
             )
+            loss = loss + surface_far_prior_weight * torch.mean(
+                torch.clamp(far_opac - surface_far_opacity_cap, min=0.0) ** 2
+            )
+        scale_loss = float(config.get("scale_prior_weight", 0.01)) * torch.mean(
+            (model.log_scales - torch.log(torch.clamp(scale_targets, min=1e-4)))
             ** 2
         )
         loss = loss + scale_loss
+        if projected_scale_prior_weight > 0 and model.positions.numel() > 0:
+            origin_t = torch.as_tensor(
+                c2w[:3, 3], dtype=torch.float32, device=device
+            )
+            rotation_t = torch.as_tensor(
+                c2w[:3, :3], dtype=torch.float32, device=device
+            )
+            cam_z = ((model.positions - origin_t[None, :]) @ rotation_t)[:, 2]
+            front = cam_z > max(near * 0.8, 1e-4)
+            if torch.any(front):
+                safe_z = torch.clamp(cam_z[front], min=max(near * 0.8, 1e-4))
+                target_scale = torch.clamp(
+                    safe_z * projected_scale_target_px / fx,
+                    min=max(init_scale * 0.25, 1e-4),
+                    max=max(scale_upper * 0.9, init_scale),
+                )
+                loss = loss + projected_scale_prior_weight * torch.mean(
+                    (model.log_scales[front] - torch.log(target_scale)) ** 2
+                )
         if float(config.get("opacity_concentration_weight", 0.01)) > 0:
             opac = torch.sigmoid(model.opacity_logits)
             loss = loss + float(config.get("opacity_concentration_weight", 0.01)) * torch.mean(
@@ -1774,6 +2892,37 @@ def train_tfrf_splat(
             model.log_scales.clamp_(
                 math.log(1e-4), math.log(scale_upper)
             )
+            if (
+                surface_far_prior_weight > 0
+                and surface_far_band is not None
+                and step % surface_far_prior_every == 0
+            ):
+                positions_np = model.positions.detach().cpu().numpy()
+                far_surface_mask = torch.as_tensor(
+                    _surface_far_mask(
+                        positions_np, surface_points, surface_far_band
+                    ),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                far_mask_active = bool(far_surface_mask.any().item())
+            if (
+                surface_far_opacity_clamp > 0
+                and far_mask_active
+                and far_surface_mask is not None
+            ):
+                far_opac = torch.sigmoid(
+                    model.opacity_logits[far_surface_mask]
+                )
+                over_cap = far_opac > surface_far_opacity_clamp
+                if torch.any(over_cap):
+                    cap_logit = math.log(
+                        surface_far_opacity_clamp
+                        / max(1.0 - surface_far_opacity_clamp, 1e-4)
+                    )
+                    model.opacity_logits[far_surface_mask][over_cap] = (
+                        cap_logit
+                    )
             if step >= reset_after and step % reset_every == 0:
                 _opacity_reset(
                     model,
@@ -1783,10 +2932,67 @@ def train_tfrf_splat(
                     reset_opacity,
                     near,
                     far,
+                    exclude_mask=(
+                        far_surface_mask
+                        if (
+                            surface_far_prior_weight > 0
+                            or surface_far_opacity_clamp > 0
+                        )
+                        else None
+                    ),
                 )
                 log(
                     f"[train] step {step} 重置可见棱面透明度到 {reset_opacity:.2f}"
                 )
+            if adaptive_budget and step % budget_check_every == 0:
+                (
+                    current_cap,
+                    tile_pair_budget,
+                    tile_work_budget,
+                    tile_max_splats,
+                    vram_pressure,
+                    vram_free_mb,
+                    vram_total_mb,
+                ) = _vram_budget_update(
+                    config,
+                    device,
+                    scene_cap,
+                    current_cap,
+                    base_tile_pair_budget,
+                    base_tile_work_budget,
+                    base_tile_max_splats,
+                )
+                pruned = False
+                if (
+                    vram_pressure >= 1
+                    and int(model.positions.shape[0]) > current_cap
+                ):
+                    before = int(model.positions.shape[0])
+                    _prune_splats_to_budget(
+                        model,
+                        current_cap,
+                        device,
+                        min_opacity=float(
+                            config.get("vram_prune_opacity", 0.12)
+                        ),
+                    )
+                    pruned = int(model.positions.shape[0]) < before
+                if pruned:
+                    optimizer = build_optimizer()
+                    grad_accum = torch.zeros(
+                        len(model.positions), dtype=torch.float32, device=device
+                    )
+                    rebuild_scale_targets()
+                    log(
+                        f"[vram] step {step} 压力 {vram_pressure}，"
+                        f"剪枝到 {len(model.positions)} 棱面"
+                    )
+                elif vram_pressure > 0:
+                    log(
+                        f"[vram] step {step} 压力 {vram_pressure}，"
+                        f"空闲 {vram_free_mb:.0f}/{vram_total_mb:.0f} MiB，"
+                        f"上限 {current_cap}，tile 预算 {tile_pair_budget}"
+                    )
             if (
                 densify_enabled
                 and step >= densify_after
@@ -1799,10 +3005,10 @@ def train_tfrf_splat(
                     surface_points,
                     device,
                     grad_accum,
-                    max_splats,
+                    current_cap,
                     prune_opacity,
                     jitter_scale=max(
-                        float(np.median(point_scales)) * 0.25,
+                        float(np.median(point_scales)) * 0.18,
                         1e-4,
                     ),
                     near=near,
@@ -1814,10 +3020,202 @@ def train_tfrf_splat(
                     grad_accum = torch.zeros(
                         len(model.positions), dtype=torch.float32, device=device
                     )
+                    rebuild_scale_targets()
                     log(
                         f"[train] 密化后 {len(model.positions)} 棱面，"
                         f"透明度 {float(torch.sigmoid(model.opacity_logits).mean()):.3f}"
                     )
+                    if (
+                        vram_pressure == 0
+                        and int(model.positions.shape[0]) >= current_cap
+                        and scene_cap < max_splats_absolute
+                    ):
+                        scene_cap = min(
+                            max_splats_absolute,
+                            scene_cap + scene_cap_boost,
+                        )
+                        current_cap = scene_cap
+                        log(
+                            f"[vram] step {step} 密化达到上限，"
+                            f"棱面上限提升到 {scene_cap}"
+                        )
+            if (
+                prune_low_opacity
+                and step > 0
+                and step % prune_opacity_every == 0
+                and int(model.positions.shape[0]) > 1000
+            ):
+                opac = torch.sigmoid(model.opacity_logits)
+                keep = opac >= prune_opacity_threshold
+                keep_count = int(keep.sum().item())
+                min_keep = int(
+                    model.positions.shape[0] * min(prune_opacity_keep_ratio, 0.95)
+                )
+                if keep_count < min_keep:
+                    order = torch.argsort(opac, descending=True)[:min_keep]
+                    keep = torch.zeros_like(keep)
+                    keep[order] = True
+                    keep_count = min_keep
+                if keep_count < int(model.positions.shape[0]):
+                    keep_sorted, _ = torch.sort(
+                        torch.nonzero(keep).reshape(-1)
+                    )
+                    model.positions = torch.nn.Parameter(
+                        model.positions.detach()[keep_sorted]
+                    )
+                    model.log_scales = torch.nn.Parameter(
+                        model.log_scales.detach()[keep_sorted]
+                    )
+                    model.opacity_logits = torch.nn.Parameter(
+                        model.opacity_logits.detach()[keep_sorted]
+                    )
+                    model.color_logits = torch.nn.Parameter(
+                        model.color_logits.detach()[keep_sorted]
+                    )
+                    optimizer = build_optimizer()
+                    grad_accum = torch.zeros(
+                        len(model.positions), dtype=torch.float32, device=device
+                    )
+                    rebuild_scale_targets()
+                    log(
+                        f"[train] step {step} 清除低透明度雾点 "
+                        f"{keep_count} 个棱面"
+                    )
+            if (
+                far_prune_enabled
+                and surface_far_band is not None
+                and step >= far_prune_after
+                and step % far_prune_every == 0
+            ):
+                removed = _prune_far_surface_splats(
+                    model,
+                    surface_points,
+                    surface_far_band,
+                    device,
+                    opacity_threshold=far_prune_opacity,
+                    max_ratio=far_prune_max_ratio,
+                    keep_min_fraction=far_prune_keep_min_fraction,
+                )
+                if removed > 0:
+                    optimizer = build_optimizer()
+                    grad_accum = torch.zeros(
+                        len(model.positions), dtype=torch.float32, device=device
+                    )
+                    rebuild_scale_targets()
+                    log(
+                        f"[train] step {step} 剪除远端雾面 "
+                        f"{removed} 个棱面，当前 {len(model.positions)}"
+                    )
+            if (
+                split_large_enabled
+                and step >= split_after
+                and step % split_every == 0
+            ):
+                split_count, split_changed = _split_large_splats(
+                    model,
+                    camera,
+                    device,
+                    current_cap,
+                    near,
+                    far,
+                    np.random.default_rng(step + 7),
+                    split_scale_factor=split_scale_factor,
+                    min_split_scale_px=split_min_scale_px,
+                    max_splits=split_max_per_cycle,
+                    children_per_split=split_children,
+                    shrink_factor=split_shrink_factor,
+                )
+                if split_changed:
+                    optimizer = build_optimizer()
+                    grad_accum = torch.zeros(
+                        len(model.positions), dtype=torch.float32, device=device
+                    )
+                    rebuild_scale_targets()
+                    log(
+                        f"[train] step {step} 拆分/收缩大棱面 "
+                        f"({split_count} 个拆分)，当前 {len(model.positions)} 棱面"
+                    )
+            if (
+                hole_fill_enabled
+                and step >= hole_fill_after
+                and step % hole_fill_every == 0
+                and step % densify_every != 0
+            ):
+                scene_hole_boost = (
+                    hole_fill_add_scene_boost
+                    if vram_pressure == 0
+                    and last_raw_holes >= scene_demand_hole_min
+                    else 0
+                )
+                hole_budget = min(
+                    hole_fill_add + scene_hole_boost,
+                    max(0, current_cap - int(model.positions.shape[0])),
+                )
+                filled = False
+                raw_holes = 0
+                if hole_budget > 0:
+                    filled, raw_holes = _hole_fill_splats(
+                        model,
+                        camera,
+                        images[int(camera_choices[step])],
+                        background,
+                        near,
+                        far,
+                        device,
+                        rng,
+                        hole_budget,
+                        low_res=hole_fill_low_res,
+                        scale_ceiling=scale_upper,
+                        tile_pair_budget=tile_pair_budget,
+                        tile_max_splats=tile_max_splats,
+                        tile_work_budget=tile_work_budget,
+                        use_cuda_tile=use_cuda_tile,
+                        scale_px_factor=float(
+                            config.get("hole_fill_scale_px_factor", 1.2)
+                        ),
+                        median_scale_factor=float(
+                            config.get("hole_fill_median_scale_factor", 0.55)
+                        ),
+                        scale_ceiling_factor=float(
+                            config.get("hole_fill_scale_ceiling_factor", 1.4)
+                        ),
+                        opacity_center=float(
+                            config.get("hole_fill_opacity", 0.3)
+                        ),
+                        depth_ratios=tuple(
+                            float(value)
+                            for value in config.get(
+                                "hole_fill_depth_ratios",
+                                [0.97, 1.00, 1.03],
+                            )
+                        ),
+                        disk_cutoff=disk_cutoff,
+                        falloff_power=falloff_power,
+                    )
+                if filled:
+                    optimizer = build_optimizer()
+                    grad_accum = torch.zeros(
+                        len(model.positions), dtype=torch.float32, device=device
+                    )
+                    rebuild_scale_targets()
+                    log(
+                        f"[train] step {step} 补洞后 {len(model.positions)} 棱面"
+                    )
+                if (
+                    vram_pressure == 0
+                    and raw_holes >= scene_demand_hole_min
+                    and scene_cap < max_splats_absolute
+                ):
+                    scene_cap = min(
+                        max_splats_absolute,
+                        scene_cap + scene_cap_boost,
+                    )
+                    current_cap = scene_cap
+                    log(
+                        f"[vram] step {step} 场景仍有 {raw_holes} 个空洞像素，"
+                        f"棱面上限提升到 {scene_cap}"
+                    )
+                last_raw_holes = raw_holes
 
         if step % eval_every == 0 or step == steps - 1:
             eval_index = (step // eval_every) % len(eval_cameras)
@@ -1857,6 +3255,10 @@ def train_tfrf_splat(
                     "step": step,
                     "totalSteps": steps,
                     "vramMB": vram_mb,
+                    "vramFreeMB": int(vram_free_mb),
+                    "vramPressure": vram_pressure,
+                    "splatLimit": current_cap,
+                    "splatCount": int(model.positions.shape[0]),
                     "elapsed": round(time.time() - start_wall, 2),
                 }
             )
@@ -1877,6 +3279,10 @@ def train_tfrf_splat(
                     "psnr": metrics["psnr"],
                     "ssim": metrics["ssim"],
                     "vramMB": vram_mb,
+                    "vramFreeMB": int(vram_free_mb),
+                    "vramPressure": vram_pressure,
+                    "splatLimit": current_cap,
+                    "splatCount": int(model.positions.shape[0]),
                     "metrics": history,
                 },
             )
@@ -1889,5 +3295,55 @@ def train_tfrf_splat(
                 float(loss.detach().cpu()),
             )
         status_after(project_dir, task_id)
+
+    if bool(config.get("final_cleanup", False)):
+        with torch.no_grad():
+            opacity = torch.sigmoid(model.opacity_logits)
+            keep = opacity >= float(config.get("final_prune_opacity", 0.08))
+            if surface_far_band is not None:
+                positions_np = model.positions.detach().cpu().numpy()
+                final_far_mask = torch.as_tensor(
+                    _surface_far_mask(
+                        positions_np, surface_points, surface_far_band
+                    ),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                keep = keep & (
+                    ~(
+                        final_far_mask
+                        & (
+                            opacity
+                            < float(config.get("final_far_prune_opacity", 0.25))
+                        )
+                    )
+                )
+            min_keep = int(
+                model.positions.shape[0]
+                * min(float(config.get("final_keep_ratio", 0.60)), 0.95)
+            )
+            if int(keep.sum().item()) < min_keep:
+                order = torch.argsort(opacity, descending=True)[:min_keep]
+                keep = torch.zeros_like(keep)
+                keep[order] = True
+            if int(keep.sum().item()) < int(model.positions.shape[0]):
+                keep_sorted, _ = torch.sort(
+                    torch.nonzero(keep).reshape(-1)
+                )
+                model.positions = torch.nn.Parameter(
+                    model.positions.detach()[keep_sorted]
+                )
+                model.log_scales = torch.nn.Parameter(
+                    model.log_scales.detach()[keep_sorted]
+                )
+                model.opacity_logits = torch.nn.Parameter(
+                    model.opacity_logits.detach()[keep_sorted]
+                )
+                model.color_logits = torch.nn.Parameter(
+                    model.color_logits.detach()[keep_sorted]
+                )
+                log(
+                    f"[train] 最终清理后 {len(model.positions)} 棱面"
+                )
 
     return {"model": model, "history": history, "engine": "facets"}, history

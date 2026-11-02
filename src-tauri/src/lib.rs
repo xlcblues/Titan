@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -867,15 +869,68 @@ fn start_reconstruction(
         "tile_pair_budget": 4000000,
         "tile_work_budget": 32000000,
         "tile_max_splats": 8192,
-        "max_splats": 50000,
+        "max_splats": 80000,
+        "max_splats_absolute": 150000,
+        "adaptive_budget": true,
+        "budget_check_every": 20,
+        "vram_headroom_mb": 1200,
+        "vram_low_mb": 2200,
+        "vram_critical_mb": 1400,
+        "splat_mb_estimate": 0.012,
+        "adaptive_min_splats": 30000,
+        "vram_tight_tile_pair_budget": 2000000,
+        "vram_tight_tile_work_budget": 12000000,
+        "vram_tight_tile_max_splats": 4096,
+        "vram_critical_tile_pair_budget": 1200000,
+        "vram_critical_tile_max_splats": 3072,
+        "vram_prune_opacity": 0.12,
+        "scene_cap_boost": 10000,
+        "scene_demand_hole_min": 200,
+        "hole_fill_add_scene_boost": 4000,
         "sparse_points_limit": 50000,
         "render_original_resolution": true,
         "global_residual_resolution": 16,
         "global_residual_weight": 0.6,
         "init_target_px": 1.3,
+        "init_opacity": 0.45,
+        "surface_prior_weight": 0.015,
+        "scale_prior_weight": 0.01,
+        "ssim_loss_weight": 0.3,
+        "ssim_window_size": 9,
+        "projected_scale_prior_weight": 0.02,
+        "projected_scale_target_px": 1.5,
+        "split_large_splats": true,
+        "split_after": 200,
+        "split_every": 50,
+        "split_scale_factor": 0.55,
+        "split_min_projected_px": 2.0,
+        "split_max_per_cycle": 4000,
+        "split_children": 4,
+        "split_shrink_factor": 0.85,
+        "opacity_reset_value": 0.45,
+        "scale_log_clamp": 2.5,
+        "ray_cover_points": 6000,
+        "hole_fill": true,
+        "hole_fill_after": 100,
+        "hole_fill_every": 20,
+        "hole_fill_add": 2800,
+        "hole_fill_resolution": 192,
+        "hole_fill_scale_px_factor": 1.1,
+        "hole_fill_median_scale_factor": 0.45,
+        "hole_fill_scale_ceiling_factor": 1.2,
+        "hole_fill_opacity": 0.25,
+        "hole_fill_depth_ratios": [0.97, 1.0, 1.03],
+        "opacity_concentration_weight": 0.04,
+        "far_prune": true,
+        "far_prune_after": 120,
+        "far_prune_every": 20,
+        "far_prune_opacity": 0.3,
+        "far_prune_max_ratio": 0.7,
+        "far_prune_keep_min_fraction": 0.15,
+        "final_cleanup": true,
         "background_residual_weight": 0.0,
-        "disk_cutoff": 1.8,
-        "falloff_power": 1.0,
+        "disk_cutoff": 1.7,
+        "falloff_power": 1.2,
         "pose_source": "auto",
         "colmap_path": "",
         "sfm_matcher": "sequential",
@@ -1074,12 +1129,136 @@ fn get_scene(app: tauri::AppHandle, project_id: String) -> Result<Option<Value>,
     serde_json::from_str(&raw).map(Some).map_err(|error| error.to_string())
 }
 
+fn probe_nvidia_smi() -> Option<String> {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[tauri::command]
+fn get_diagnostics(app: tauri::AppHandle) -> Result<Value, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| error.to_string())?;
+    let crash_dir = app_data_dir(&app)?.join("crash");
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(0);
+    Ok(json!({
+        "app": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "cpuCores": cpu_cores,
+        "gpu": probe_nvidia_smi(),
+        "python": resolve_python().ok(),
+        "logDir": log_dir.to_string_lossy(),
+        "crashDir": crash_dir.to_string_lossy(),
+    }))
+}
+
+#[tauri::command]
+fn write_crash_report(
+    app: tauri::AppHandle,
+    source: String,
+    message: String,
+    detail: Option<String>,
+) -> Result<String, String> {
+    let dir = app_data_dir(&app)?.join("crash");
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let file_name = format!("crash-{}-{}.txt", now_millis(), uuid::Uuid::new_v4().simple());
+    let body = format!(
+        "source: {source}\nmessage: {message}\ndetail:\n{}\n",
+        detail.unwrap_or_default()
+    );
+    let path = dir.join(&file_name);
+    fs::write(&path, body).map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(tauri_plugin_log::log::LevelFilter::Info)
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                .file_open_strategy(tauri_plugin_log::FileOpenStrategy::Rotate)
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("titan".into()),
+                    }),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                ])
+                .build(),
+        )
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let crash_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| error.to_string())?
+                .join("crash");
+            fs::create_dir_all(&crash_dir).map_err(|error| error.to_string())?;
+            let default_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let payload = info.payload();
+                let message = if let Some(value) = payload.downcast_ref::<&str>() {
+                    (*value).to_string()
+                } else if let Some(value) = payload.downcast_ref::<String>() {
+                    value.clone()
+                } else {
+                    "unknown panic".into()
+                };
+                let location = info
+                    .location()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let file_name = format!("crash-{}.txt", now_millis());
+                let _ = fs::write(
+                    crash_dir.join(&file_name),
+                    format!(
+                        "Titan crash report\nmessage: {message}\nlocation: {location}\n",
+                    ),
+                );
+                default_hook(info);
+            }));
+            tauri_plugin_log::log::info!(
+                "Titan {} started on {} {}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
             let db_path = app
                 .path()
                 .app_data_dir()
@@ -1103,7 +1282,10 @@ pub fn run() {
             cancel_task,
             get_task,
             get_metrics,
-            get_scene
+            get_scene,
+            get_diagnostics,
+            write_crash_report,
+            open_log_dir
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

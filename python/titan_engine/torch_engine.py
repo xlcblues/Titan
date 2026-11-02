@@ -101,7 +101,7 @@ def render_view(
     directions = local @ rotation.T
     directions = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
     near, far = (
-        ray_bounds_from_points(origin, scene_points)
+        ray_bounds_from_points(origin, scene_points, rotation=rotation)
         if scene_points is not None and len(scene_points)
         else (2.4, 7.6)
     )
@@ -223,7 +223,9 @@ def train_tfrf_torch(
             directions, axis=-1, keepdims=True
         )
 
-        near, far = ray_bounds_from_points(origin, scene_points)
+        near, far = ray_bounds_from_points(
+            origin, scene_points, rotation=rotation
+        )
         rendered = render_rays(
             model,
             origin,

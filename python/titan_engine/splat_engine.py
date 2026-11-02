@@ -1999,6 +1999,7 @@ def _split_large_splats(
     rng: np.random.Generator,
     split_scale_factor: float = 0.55,
     min_split_scale_px: float = 2.4,
+    min_split_screen_fraction: float = 0.1,
     max_splits: int = 3000,
     children_per_split: int = 4,
     shrink_factor: float = 0.85,
@@ -2011,7 +2012,16 @@ def _split_large_splats(
     if int(model.positions.shape[0]) == 0:
         return (0, False)
     with torch.no_grad():
-        rotation, origin, fx, _, _, _, _, _ = _camera_geometry(camera, device)
+        rotation, origin, fx, _, _, _, cam_width, cam_height = _camera_geometry(
+            camera, device
+        )
+        screen_ref = max(1, min(int(cam_width), int(cam_height)))
+        min_split_scale_px = max(
+            float(min_split_scale_px),
+            screen_ref
+            * max(float(min_split_screen_fraction), 0.01)
+            / 2.8,
+        )
         _, _, _, z, visible = _project_points(
             model.positions,
             rotation,
@@ -2199,10 +2209,11 @@ def _hole_fill_splats(
     tile_max_splats: int = 8192,
     tile_work_budget: int = 2_000_000,
     use_cuda_tile: bool = True,
-    scale_px_factor: float = 2.0,
-    median_scale_factor: float = 0.7,
-    scale_ceiling_factor: float = 4.0,
-    opacity_center: float = 0.35,
+    scale_px_factor: float = 6.0,
+    median_scale_factor: float = 0.9,
+    scale_ceiling_factor: float = 8.0,
+    max_scale_screen_fraction: float = 0.1,
+    opacity_center: float = 0.4,
     depth_ratios: tuple[float, ...] = (0.90, 1.00, 1.10),
     disk_cutoff: float = 1.8,
     falloff_power: float = 1.0,
@@ -2366,15 +2377,25 @@ def _hole_fill_splats(
         scales = torch.exp(model.log_scales.detach())
         median_scale = float(scales.median().item())
         pixel_scale = z_values / max(fx_lr, 1e-4)
+        screen_ref = max(1, min(low_width, low_height))
+        screen_scale_cap = (
+            z_values
+            * max(float(max_scale_screen_fraction), 0.02)
+            * screen_ref
+            / (max(fx_lr, fy_lr) * 2.8)
+        )
         new_scale = np.clip(
             np.maximum(
                 pixel_scale * max(float(scale_px_factor), 0.5),
                 median_scale * max(float(median_scale_factor), 0.2),
             ),
             float(scale_floor),
-            max(
-                float(scale_ceiling),
-                median_scale * max(float(scale_ceiling_factor), 1.0),
+            np.minimum(
+                max(
+                    float(scale_ceiling),
+                    median_scale * max(float(scale_ceiling_factor), 1.0),
+                ),
+                screen_scale_cap,
             ),
         )
         new_colors = np.repeat(
@@ -2844,12 +2865,14 @@ def train_tfrf_splat(
                 device=device,
             )
             far_mask_active = bool(far_surface_mask.any().item())
+    scale_target_cap_factor = float(config.get("scale_target_cap_factor", 8.0))
     scale_targets = torch.as_tensor(
         _scale_targets_for_splats(
             points,
             surface_points,
             init_scale,
             far_scale_factor=float(config.get("far_scale_factor", 0.8)),
+            cap_factor=scale_target_cap_factor,
         ),
         dtype=torch.float32,
         device=device,
@@ -2864,6 +2887,7 @@ def train_tfrf_splat(
                 surface_points,
                 init_scale,
                 far_scale_factor=float(config.get("far_scale_factor", 0.8)),
+                cap_factor=scale_target_cap_factor,
             ),
             dtype=torch.float32,
             device=device,
@@ -2929,10 +2953,14 @@ def train_tfrf_splat(
     reset_after = int(config.get("opacity_reset_after", 140))
     reset_every = int(config.get("opacity_reset_every", 100))
     reset_opacity = float(config.get("opacity_reset_value", 0.7))
-    scale_upper = max(
-        init_scale * float(config.get("scale_log_clamp", 6.0)),
-        float(config.get("scale_upper_floor", 0.2)),
-    )
+    scale_limit_enabled = bool(config.get("scale_limit_enabled", False))
+    if scale_limit_enabled:
+        scale_upper = max(
+            init_scale * float(config.get("scale_log_clamp", 6.0)),
+            float(config.get("scale_upper_floor", 0.2)),
+        )
+    else:
+        scale_upper = float("inf")
     ssim_loss_weight = float(config.get("ssim_loss_weight", 0.2))
     ssim_window_size = int(config.get("ssim_window_size", 11))
     edge_loss_weight = float(config.get("edge_loss_weight", 0.0))
@@ -2948,6 +2976,9 @@ def train_tfrf_splat(
     split_every = max(1, int(config.get("split_every", 50)))
     split_scale_factor = float(config.get("split_scale_factor", 0.55))
     split_min_scale_px = float(config.get("split_min_projected_px", 2.4))
+    split_min_screen_fraction = float(
+        config.get("split_min_screen_fraction", 0.1)
+    )
     split_max_per_cycle = int(config.get("split_max_per_cycle", 3000))
     split_children = int(config.get("split_children", 4))
     split_shrink_factor = float(config.get("split_shrink_factor", 0.85))
@@ -3452,6 +3483,7 @@ def train_tfrf_splat(
                     np.random.default_rng(step + 7),
                     split_scale_factor=split_scale_factor,
                     min_split_scale_px=split_min_scale_px,
+                    min_split_screen_fraction=split_min_screen_fraction,
                     max_splits=split_max_per_cycle,
                     children_per_split=split_children,
                     shrink_factor=split_shrink_factor,
@@ -3518,16 +3550,19 @@ def train_tfrf_splat(
                     tile_work_budget=tile_work_budget,
                     use_cuda_tile=use_cuda_tile,
                     scale_px_factor=float(
-                        config.get("hole_fill_scale_px_factor", 1.2)
+                        config.get("hole_fill_scale_px_factor", 6.0)
                     ),
                     median_scale_factor=float(
-                        config.get("hole_fill_median_scale_factor", 0.55)
+                        config.get("hole_fill_median_scale_factor", 0.9)
                     ),
                     scale_ceiling_factor=float(
-                        config.get("hole_fill_scale_ceiling_factor", 1.4)
+                        config.get("hole_fill_scale_ceiling_factor", 8.0)
+                    ),
+                    max_scale_screen_fraction=float(
+                        config.get("hole_fill_max_screen_fraction", 0.1)
                     ),
                     opacity_center=float(
-                        config.get("hole_fill_opacity", 0.3)
+                        config.get("hole_fill_opacity", 0.4)
                     ),
                     depth_ratios=depth_ratios,
                     disk_cutoff=disk_cutoff,
@@ -3714,16 +3749,19 @@ def train_tfrf_splat(
             tile_work_budget=tile_work_budget,
             use_cuda_tile=use_cuda_tile,
             scale_px_factor=float(
-                config.get("hole_fill_scale_px_factor", 1.2)
+                config.get("hole_fill_scale_px_factor", 6.0)
             ),
             median_scale_factor=float(
-                config.get("hole_fill_median_scale_factor", 0.55)
+                config.get("hole_fill_median_scale_factor", 0.9)
             ),
             scale_ceiling_factor=float(
-                config.get("hole_fill_scale_ceiling_factor", 1.4)
+                config.get("hole_fill_scale_ceiling_factor", 8.0)
+            ),
+            max_scale_screen_fraction=float(
+                config.get("hole_fill_max_screen_fraction", 0.1)
             ),
             opacity_center=float(
-                config.get("hole_fill_opacity", 0.3)
+                config.get("hole_fill_opacity", 0.4)
             ),
             depth_ratios=final_depth_ratios,
             disk_cutoff=disk_cutoff,

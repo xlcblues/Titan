@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import time
 
 import torch
 from torch.utils.cpp_extension import load as _torch_load
@@ -103,6 +104,59 @@ def _ensure_cuda_env() -> None:
         os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 
+def _clean_stale_build_locks(build_dir: str) -> None:
+    """Remove lock files left behind by an interrupted compile.
+
+    torch's in-process ninja loader blocks forever on these files after a
+    cancelled build, which makes the first training step look stuck at 0.
+    The desktop app also removes these locks when a fresh task starts; the
+    generous age guard here is only a fallback so an active long compile is
+    never disturbed.
+    """
+    try:
+        for name in ("lock", ".ninja_lock"):
+            path = os.path.join(build_dir, name)
+            if not os.path.isfile(path):
+                continue
+            age = time.time() - os.path.getmtime(path)
+            if age >= 600.0:
+                try:
+                    os.remove(path)
+                    print(f"[tile_cuda] 清理过期编译锁 {path} ({age:.0f}s)")
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _notify_build_start() -> None:
+    project_dir = os.environ.get("TITAN_PROJECT_DIR")
+    task_id = os.environ.get("TITAN_TASK_ID")
+    if not project_dir or not task_id:
+        return
+    try:
+        payload = {
+            "taskId": task_id,
+            "status": "running",
+            "stage": "training",
+            "progress": 0.12,
+            "step": 0,
+            "totalSteps": 0,
+            "loss": None,
+            "message": "正在编译 CUDA 渲染内核，首次约需 1-2 分钟",
+        }
+        os.makedirs(project_dir, exist_ok=True)
+        with open(
+            os.path.join(project_dir, "status.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(__import__("json").dumps(payload, ensure_ascii=False))
+        print(__import__("json").dumps(payload, ensure_ascii=False), flush=True)
+    except OSError:
+        pass
+
+
 def tile_cuda():
     """Return the compiled CUDA module, or None when it cannot be built."""
     global _CACHE
@@ -122,6 +176,8 @@ def tile_cuda():
         source_dir = os.path.dirname(os.path.abspath(__file__))
         build_dir = os.path.join(source_dir, "build")
         os.makedirs(build_dir, exist_ok=True)
+        _clean_stale_build_locks(build_dir)
+        _notify_build_start()
         extra_cuda = ["-O3"]
         extra_cflags = ["/O2"] if os.name == "nt" else ["-O3"]
         if os.name == "nt":

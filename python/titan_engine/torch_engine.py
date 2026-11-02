@@ -166,7 +166,10 @@ def train_tfrf_torch(
     steps = int(config.get("steps", 400))
     patch = int(config.get("patch_size", 512))
     eval_every = int(config.get("eval_every", 60))
-    progress_every = int(config.get("progress_every", 10))
+    training_progress_every = max(
+        1,
+        int(config.get("training_progress_every", config.get("progress_every", 1))),
+    )
     sample_count = int(config.get("samples", 32))
     learning_rate = float(config.get("learning_rate", 0.004))
     full_image = bool(config.get("full_image", False))
@@ -198,10 +201,12 @@ def train_tfrf_torch(
         f"[train] TFRF-torch 开始，{len(train_cameras)} 训练视角，"
         f"{steps} 步，设备 {device}"
     )
+    emit_training_status(project_dir, task_id, 0, steps)
     history: list[dict] = []
     start_wall = time.time()
 
     for step in range(steps):
+        step_start = time.time()
         camera = train_cameras[int(camera_choices[step])]
         c2w = np.asarray(camera["c2w"], dtype=np.float32)
         width, height = camera["width"], camera["height"]
@@ -251,6 +256,15 @@ def train_tfrf_torch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
+        log(f"[train] step {step + 1}/{steps} 用时 {time.time() - step_start:.2f}s")
+        if step % training_progress_every == 0:
+            emit_training_status(
+                project_dir,
+                task_id,
+                step,
+                steps,
+                float(loss.detach().cpu()),
+            )
         if step % eval_every == 0 or step == steps - 1:
             eval_index = (step // eval_every) % len(eval_cameras)
             eval_camera = eval_cameras[eval_index]
@@ -289,22 +303,15 @@ def train_tfrf_torch(
                     "taskId": task_id,
                     "status": "running",
                     "stage": "training",
-                    "progress": round((step + 1) / steps, 4),
+                    "progress": round(0.12 + 0.78 * ((step + 1) / steps), 4),
                     "step": step,
+                    "totalSteps": steps,
                     "loss": metrics["loss"],
                     "psnr": metrics["psnr"],
                     "ssim": metrics["ssim"],
                     "vramMB": vram_mb,
                     "metrics": history,
                 },
-            )
-        elif step % progress_every == 0:
-            emit_training_status(
-                project_dir,
-                task_id,
-                step,
-                steps,
-                float(loss.detach().cpu()),
             )
         status_after(project_dir, task_id)
 

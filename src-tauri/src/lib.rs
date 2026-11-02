@@ -247,6 +247,15 @@ fn write_control(project_dir: &Path, command: &str) -> Result<(), String> {
     fs::write(project_dir.join("control.json"), raw).map_err(|error| error.to_string())
 }
 
+fn clean_tile_build_locks(build_dir: &Path) {
+    for name in ["lock", ".ninja_lock"] {
+        let path = build_dir.join(name);
+        if path.is_file() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 #[tauri::command]
 fn app_info() -> AppInfo {
     AppInfo {
@@ -956,6 +965,24 @@ fn start_reconstruction(
         return Err(format!("未找到 Python 引擎：{}", engine_root.display()));
     }
     let python = resolve_python()?;
+    let has_running_task = {
+        let registry = app.state::<TaskRegistry>();
+        let mut guard = registry.0.lock().unwrap();
+        guard.iter_mut().any(|(_, child)| {
+            child
+                .try_wait()
+                .map(|status| status.is_none())
+                .unwrap_or(false)
+        })
+    };
+    if !has_running_task {
+        clean_tile_build_locks(
+            &engine_root
+                .join("titan_engine")
+                .join("tile_cuda")
+                .join("build"),
+        );
+    }
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let now = now_millis();
@@ -1002,6 +1029,8 @@ fn start_reconstruction(
         .arg("--config-json")
         .arg(&config_arg)
         .current_dir(&engine_root)
+        .env("TITAN_PROJECT_DIR", &project_arg)
+        .env("TITAN_TASK_ID", &task_arg)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));

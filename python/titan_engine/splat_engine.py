@@ -2362,7 +2362,10 @@ def train_tfrf_splat(
     steps = int(config.get("steps", 1200))
     patch = int(config.get("patch_size", 1024))
     eval_every = int(config.get("eval_every", 100))
-    progress_every = int(config.get("progress_every", 10))
+    training_progress_every = max(
+        1,
+        int(config.get("training_progress_every", config.get("progress_every", 1))),
+    )
     learning_rate = float(config.get("learning_rate", 0.02))
     render_batch = int(config.get("render_batch_size", 256))
     render_tile = max(1, int(config.get("render_tile_size", 16)))
@@ -2591,6 +2594,10 @@ def train_tfrf_splat(
         f"场景尺度 {scene_scale:.4f}，原分辨率 {train_original}，"
         f"最大像素 {train_max_pixels}"
     )
+    emit_training_status(project_dir, task_id, 0, steps)
+    if use_cuda_tile:
+        log("[train] 正在编译/加载 CUDA 渲染内核，首次约需 1-2 分钟")
+        _tile_cuda_loader()
     history: list[dict] = []
     start_wall = time.time()
     densify_every = max(1, int(config.get("densify_every", 50)))
@@ -2676,6 +2683,7 @@ def train_tfrf_splat(
         grad_accum.mul_(0.95).add_(current)
 
     for step in range(steps):
+        step_start = time.time()
         camera = train_cameras[int(camera_choices[step])]
         c2w = np.asarray(camera["c2w"], dtype=np.float32)
         width, height = camera["width"], camera["height"]
@@ -3217,6 +3225,15 @@ def train_tfrf_splat(
                     )
                 last_raw_holes = raw_holes
 
+        log(f"[train] step {step + 1}/{steps} 用时 {time.time() - step_start:.2f}s")
+        if step % training_progress_every == 0:
+            emit_training_status(
+                project_dir,
+                task_id,
+                step,
+                steps,
+                float(loss.detach().cpu()),
+            )
         if step % eval_every == 0 or step == steps - 1:
             eval_index = (step // eval_every) % len(eval_cameras)
             eval_camera = eval_cameras[eval_index]
@@ -3273,8 +3290,9 @@ def train_tfrf_splat(
                     "taskId": task_id,
                     "status": "running",
                     "stage": "training",
-                    "progress": round((step + 1) / steps, 4),
+                    "progress": round(0.12 + 0.78 * ((step + 1) / steps), 4),
                     "step": step,
+                    "totalSteps": steps,
                     "loss": metrics["loss"],
                     "psnr": metrics["psnr"],
                     "ssim": metrics["ssim"],
@@ -3285,14 +3303,6 @@ def train_tfrf_splat(
                     "splatCount": int(model.positions.shape[0]),
                     "metrics": history,
                 },
-            )
-        elif step % progress_every == 0:
-            emit_training_status(
-                project_dir,
-                task_id,
-                step,
-                steps,
-                float(loss.detach().cpu()),
             )
         status_after(project_dir, task_id)
 

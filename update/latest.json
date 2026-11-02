@@ -1,11 +1,11 @@
 {
-  "version": "0.1.1",
-  "notes": "Titan 0.1.1：M5 工程化与算法优化，安装包、更新签名与更新清单同步发布。",
-  "pub_date": "2026-11-02T01:26:39Z",
+  "version": "0.1.2",
+  "notes": "Titan 0.1.2：仿照 Mars/Ceres 实现完整自动更新流程，进入设置页自动检查更新，支持下载进度与一键安装；GitHub 仓库已公开。",
+  "pub_date": "2026-11-02T03:41:24.154Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/xlcblues/Titan/releases/download/v0.1.1/Titan_0.1.1_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUajRKTVc1c3JXdjhTNnJLRVoveW15emM1Rkx4UnZGSk83UXBtOUVIODRDaTY3MVRDYytiVWIrZExJVitVWmIyTmQ0VmNxMHZhVVJ1YmMxTk5nME15b296TG8zQ1pIZ1FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNTgyNzg0CWZpbGU6VGl0YW5fMC4xLjFfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMS4xCmJwcG5SMHkrTTJzQXhqc0tZRTFHQmVTL0FvdDVqZEJMMTRYemRBYmFPeUhOZGJHdEo2YSsxcmI3MldLempiZWdTUlYyZEFGdUxWZDlFUXNWenRQakNRPT0K"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUajRKTVc1c3JXdjJGQVc5TDNRYmpqeUVVV0YyUHVLQWl6V3lQSVp5ZHJUZHJ1dG1HUnNraUdqeUwxbWwyS0FCTHZjRTZCYUFmUVpnbmNjRS9ZZmlqZkVlMC9tTXlhS3d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNTkwODg0CWZpbGU6VGl0YW5fMC4xLjJfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMS4yCnZaK2ZTM1Nrd1hTSFZNb0dGZCt3cUY4YnR6VndwNjd1aHV4V1VweGNTVzRmS0Vxbml3QXNoRGxIazNwUUN5cjZZT3pjeW9kN1U5VU5NQVJkZkhWcUNnPT0K",
+      "url": "https://github.com/xlcblues/Titan/releases/download/v0.1.2/Titan_0.1.2_x64-setup.exe"
     }
   }
 }

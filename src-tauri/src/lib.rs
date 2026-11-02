@@ -830,6 +830,7 @@ fn start_reconstruction(
 
     let project_dir = project_dir(&app, &project_id)?;
     fs::create_dir_all(&project_dir).map_err(|error| error.to_string())?;
+    write_control(&project_dir, "run")?;
 
     let mut paths = Vec::new();
     {
@@ -959,6 +960,17 @@ fn start_reconstruction(
     let task_id = uuid::Uuid::new_v4().to_string();
     let now = now_millis();
     let config_raw = merged.to_string();
+    let initial_status = json!({
+        "taskId": task_id,
+        "status": "running",
+        "stage": "data",
+        "progress": 0.01,
+    });
+    fs::write(
+        project_dir.join("status.json"),
+        initial_status.to_string(),
+    )
+    .map_err(|error| error.to_string())?;
     conn.execute(
         "INSERT INTO tasks
            (id, project_id, type, status, stage, progress, started_at, config_json)

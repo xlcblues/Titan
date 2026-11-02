@@ -1113,6 +1113,7 @@ def write_scene_output(
 def run(project_dir: Path, task_id: str, config: dict) -> int:
     project_dir = project_dir.resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
+    write_control(project_dir, "run")
     emit_status(
         project_dir,
         {"taskId": task_id, "status": "running", "stage": "data", "progress": 0.02},

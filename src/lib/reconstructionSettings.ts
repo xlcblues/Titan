@@ -108,6 +108,7 @@ export function reconstructionConfig(
     tile_pair_budget: settings.tilePairBudget,
     tile_max_splats: 8192,
     max_splats: settings.maxSplats,
+    max_splats_absolute: settings.maxSplats,
     steps: settings.steps,
     disk_cutoff: 1.7,
     falloff_power: 1.2,

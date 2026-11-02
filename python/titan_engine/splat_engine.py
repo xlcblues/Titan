@@ -2132,6 +2132,56 @@ def _split_large_splats(
         return (split_count, True)
 
 
+def _sample_hole_pixels(
+    hole_mask: np.ndarray,
+    hole_count: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pick unresolved pixels with even spatial coverage."""
+    ys, xs = np.nonzero(hole_mask)
+    total = int(ys.size)
+    hole_count = max(0, min(int(hole_count), total))
+    if hole_count == 0:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+        )
+    if hole_count >= total:
+        return ys.astype(np.int64), xs.astype(np.int64)
+    height, width = hole_mask.shape
+    cell_size = max(2, int(math.ceil(max(height, width) / 8)))
+    cols = max(1, int(math.ceil(width / cell_size)))
+    keys = (ys // cell_size) * cols + (xs // cell_size)
+    cells, inverse, counts = np.unique(
+        keys, return_inverse=True, return_counts=True
+    )
+    quotas = np.floor(counts * hole_count / total).astype(np.int64)
+    remainder = int(hole_count - int(quotas.sum()))
+    if remainder > 0:
+        order = np.argsort(-counts)[:remainder]
+        quotas[order] += 1
+    selected_y: list[int] = []
+    selected_x: list[int] = []
+    for cell_index, _ in enumerate(cells):
+        quota = int(quotas[cell_index])
+        if quota <= 0:
+            continue
+        positions = np.nonzero(inverse == cell_index)[0]
+        if quota >= positions.size:
+            picked = positions
+        else:
+            picked = positions[
+                rng.choice(positions.size, size=quota, replace=False)
+            ]
+        selected_y.extend(ys[picked].tolist())
+        selected_x.extend(xs[picked].tolist())
+    order = rng.permutation(len(selected_y))
+    return (
+        np.asarray(selected_y, dtype=np.int64)[order],
+        np.asarray(selected_x, dtype=np.int64)[order],
+    )
+
+
 def _hole_fill_splats(
     model: SplatFacetField,
     camera: dict,
@@ -2156,13 +2206,13 @@ def _hole_fill_splats(
     depth_ratios: tuple[float, ...] = (0.90, 1.00, 1.10),
     disk_cutoff: float = 1.8,
     falloff_power: float = 1.0,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, np.ndarray | None]:
     """Backproject unresolved pixels into new facets along multiple depths."""
     from PIL import Image
 
     max_add = max(0, int(max_add))
-    if max_add == 0 or model.positions.numel() == 0:
-        return (False, 0)
+    if model.positions.numel() == 0:
+        return (False, 0, None)
     depth_ratios = tuple(
         float(value) for value in (depth_ratios or (1.0,))
     )
@@ -2219,14 +2269,11 @@ def _hole_fill_splats(
         hole_count = int(hole_mask.sum())
         raw_hole_count = hole_count
         if hole_count == 0:
-            return (False, 0)
+            return (False, 0, hole_mask)
         hole_count = min(hole_count, max_add // depth_per_hole)
         if hole_count == 0:
-            return (False, raw_hole_count)
-        ys, xs = np.nonzero(hole_mask)
-        chosen = rng.choice(len(ys), size=hole_count, replace=False)
-        ys = ys[chosen].astype(np.int64)
-        xs = xs[chosen].astype(np.int64)
+            return (False, raw_hole_count, hole_mask)
+        ys, xs = _sample_hole_pixels(hole_mask, hole_count, rng)
 
         c2w = np.asarray(camera["c2w"], dtype=np.float32)
         origin = c2w[:3, 3]
@@ -2256,18 +2303,48 @@ def _hole_fill_splats(
         mu_np = model_u.detach().cpu().numpy()
         mv_np = model_v.detach().cpu().numpy()
         search_radius = max(2.0, low_width * 0.015)
+        ui_int = np.floor(mu_np + 0.5).astype(np.int32)
+        vi_int = np.floor(mv_np + 0.5).astype(np.int32)
+        in_bounds = (
+            (ui_int >= 0)
+            & (ui_int < low_width)
+            & (vi_int >= 0)
+            & (vi_int < low_height)
+            & (mz_np > near)
+            & (mz_np < far)
+        )
+        pixel_bins: dict[int, list[int]] = {}
+        for index in np.nonzero(in_bounds)[0]:
+            pixel_bins.setdefault(
+                int(vi_int[index] * low_width + ui_int[index]), []
+            ).append(int(index))
+        radius = int(math.ceil(search_radius))
+        max_dist2 = search_radius * search_radius
         base_depths = np.empty(hole_count, dtype=np.float32)
         for hole_index in range(hole_count):
-            du = mu_np - xs[hole_index]
-            dv = mv_np - ys[hole_index]
-            dist2 = du * du + dv * dv
-            local = (dist2 < search_radius * search_radius)
-            local &= mz_np > near
-            local &= mz_np < far
-            candidate = np.nonzero(local)[0]
-            if candidate.size:
-                nearest = candidate[int(np.argmin(dist2[candidate]))]
-                base_depths[hole_index] = float(mz_np[nearest])
+            px = int(xs[hole_index])
+            py = int(ys[hole_index])
+            best_index = -1
+            best_dist2 = max_dist2
+            for dy in range(-radius, radius + 1):
+                cell_y = py + dy
+                if cell_y < 0 or cell_y >= low_height:
+                    continue
+                for dx in range(-radius, radius + 1):
+                    cell_x = px + dx
+                    if cell_x < 0 or cell_x >= low_width:
+                        continue
+                    for index in pixel_bins.get(
+                        cell_y * low_width + cell_x, ()
+                    ):
+                        du = float(mu_np[index]) - float(px)
+                        dv = float(mv_np[index]) - float(py)
+                        dist2 = du * du + dv * dv
+                        if dist2 < best_dist2:
+                            best_dist2 = dist2
+                            best_index = index
+            if best_index >= 0:
+                base_depths[hole_index] = float(mz_np[best_index])
             else:
                 base_depths[hole_index] = z_median
         depth_ratio_values = np.tile(
@@ -2336,7 +2413,253 @@ def _hole_fill_splats(
         model.color_logits = torch.nn.Parameter(
             torch.cat([model.color_logits.detach(), color_t], dim=0)
         )
-        return (True, raw_hole_count)
+        return (True, raw_hole_count, hole_mask)
+
+
+def _split_splats_into_holes(
+    model: SplatFacetField,
+    camera: dict,
+    device: torch.device,
+    near: float,
+    far: float,
+    hole_mask: np.ndarray | None,
+    low_res: int = 192,
+    max_splits: int = 2000,
+    max_splats: int = 150000,
+    split_scale_factor: float = 0.5,
+    opacity_floor: float = 0.3,
+    children_per_split: int = 4,
+) -> tuple[int, bool]:
+    """Split facets near unresolved pixels into smaller children.
+
+    Children are placed at the nearest hole pixel instead of only around the
+    parent, so coverage can grow inside a hole even when the total splat count
+    is already at its cap.
+    """
+    if (
+        hole_mask is None
+        or model.positions.numel() == 0
+        or int(np.count_nonzero(hole_mask)) == 0
+    ):
+        return (0, False)
+    with torch.no_grad():
+        low_camera = _aspect_lowres_camera(camera, max_pixels=low_res)
+        low_width = int(low_camera["width"])
+        low_height = int(low_camera["height"])
+        if hole_mask.shape != (low_height, low_width):
+            return (0, False)
+        rotation, origin, fx, fy, cx, cy, _, _ = _camera_geometry(
+            low_camera, device
+        )
+        positions = model.positions.detach()
+        rel = positions - origin[None, :]
+        camera_space = rel @ rotation
+        z = camera_space[:, 2:3]
+        safe_z = torch.clamp(z, min=1e-4)
+        u = fx * camera_space[:, 0:1] / safe_z + cx
+        v = fy * camera_space[:, 1:2] / safe_z + cy
+        opacity = torch.sigmoid(model.opacity_logits)
+        visible = (
+            (z[:, 0] > near)
+            & (z[:, 0] < far)
+            & (u[:, 0] >= 0.0)
+            & (u[:, 0] < low_width)
+            & (v[:, 0] >= 0.0)
+            & (v[:, 0] < low_height)
+            & (opacity >= 0.02)
+        )
+        if not torch.any(visible):
+            return (0, False)
+        ui_np = np.floor(u[:, 0].cpu().numpy() + 0.5).astype(np.int32)
+        vi_np = np.floor(v[:, 0].cpu().numpy() + 0.5).astype(np.int32)
+        z_np = z[:, 0].cpu().numpy()
+        pixel_ok = (
+            (ui_np >= 0)
+            & (ui_np < low_width)
+            & (vi_np >= 0)
+            & (vi_np < low_height)
+        )
+        pad = 2
+        padded = np.pad(hole_mask, pad, mode="edge")
+        dilated = np.zeros_like(hole_mask)
+        for dy in range(-pad, pad + 1):
+            for dx in range(-pad, pad + 1):
+                dilated |= padded[
+                    pad + dy : pad + dy + low_height,
+                    pad + dx : pad + dx + low_width,
+                ]
+        visible_np = visible.cpu().numpy() & pixel_ok
+        candidate_mask = np.zeros(model.positions.shape[0], dtype=bool)
+        candidate_mask[visible_np] = dilated[
+            vi_np[visible_np], ui_np[visible_np]
+        ]
+        candidate_idx = np.nonzero(candidate_mask)[0]
+        if candidate_idx.size == 0:
+            return (0, False)
+        projected_sigma = (
+            torch.exp(model.log_scales) * fx / torch.clamp(z[:, 0], min=1e-4)
+        )
+        sigma_np = projected_sigma[candidate_idx].cpu().numpy()
+        order = np.argsort(-sigma_np)
+        max_splits = max(1, int(max_splits))
+        chosen_idx = candidate_idx[order[:max_splits]]
+
+        target_us: list[int] = []
+        target_vs: list[int] = []
+        kept_chosen: list[int] = []
+        for index in chosen_idx:
+            index = int(index)
+            px = int(ui_np[index])
+            py = int(vi_np[index])
+            if hole_mask[py, px]:
+                target_us.append(px)
+                target_vs.append(py)
+                kept_chosen.append(index)
+                continue
+            best_dist = pad * pad * 2 + 1
+            best: tuple[int, int] | None = None
+            for dy in range(-pad, pad + 1):
+                yy = py + dy
+                if yy < 0 or yy >= low_height:
+                    continue
+                for dx in range(-pad, pad + 1):
+                    xx = px + dx
+                    if xx < 0 or xx >= low_width:
+                        continue
+                    if hole_mask[yy, xx]:
+                        dist = dx * dx + dy * dy
+                        if dist < best_dist:
+                            best_dist = dist
+                            best = (xx, yy)
+            if best is not None:
+                target_us.append(best[0])
+                target_vs.append(best[1])
+                kept_chosen.append(index)
+        if not kept_chosen:
+            return (0, False)
+        chosen_idx = np.asarray(kept_chosen, dtype=np.int64)
+        parent_z = z_np[chosen_idx]
+        parent_scale = (
+            torch.exp(model.log_scales[chosen_idx]).cpu().numpy()
+        )
+        parent_color = model.color_logits[chosen_idx].detach()
+        parent_opacity = (
+            torch.sigmoid(model.opacity_logits[chosen_idx]).cpu().numpy()
+        )
+        target_u = np.asarray(target_us, dtype=np.float32) + 0.5
+        target_v = np.asarray(target_vs, dtype=np.float32) + 0.5
+        target_cam_x = (target_u - cx) / fx * parent_z
+        target_cam_y = (target_v - cy) / fy * parent_z
+        child_scale = np.clip(
+            parent_scale * max(float(split_scale_factor), 0.25),
+            1e-4,
+            parent_scale * 0.95,
+        )
+        child_scale = np.maximum(
+            child_scale, parent_z / max(fx, 1e-4) * 0.4
+        )
+        children = max(2, int(children_per_split))
+        offsets = np.zeros((children, 2), dtype=np.float32)
+        if children >= 1:
+            offsets[0] = [0.0, 0.0]
+        if children >= 2:
+            offsets[1] = [0.6, 0.0]
+        if children >= 3:
+            offsets[2] = [-0.6, 0.0]
+        if children >= 4:
+            offsets[3] = [0.0, 0.6]
+        cam_offsets = offsets[:, None, :] * child_scale[None, :, None]
+        base_cam = np.stack(
+            [target_cam_x, target_cam_y, parent_z], axis=-1
+        )
+        child_cam = base_cam[None, :, :] + np.concatenate(
+            [
+                cam_offsets,
+                np.zeros((children, len(chosen_idx), 1), dtype=np.float32),
+            ],
+            axis=-1,
+        )
+        rotation_np = rotation.cpu().numpy()
+        origin_np = origin.cpu().numpy()
+        child_positions = (
+            child_cam @ rotation_np.T + origin_np[None, None, :]
+        ).transpose(1, 0, 2).reshape(-1, 3)
+        child_scales = np.repeat(child_scale, children, axis=0)
+        child_colors = parent_color.repeat_interleave(children, dim=0)
+        child_opacity = np.clip(
+            parent_opacity * 0.85,
+            float(opacity_floor),
+            0.9,
+        )
+        child_opacity_logits = torch.as_tensor(
+            _logit(np.repeat(child_opacity, children)),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        keep_mask = np.ones(model.positions.shape[0], dtype=bool)
+        keep_mask[chosen_idx] = False
+        keep_t = torch.as_tensor(keep_mask, dtype=torch.bool, device=device)
+        old_keep_indices = np.nonzero(keep_mask)[0]
+        new_positions = torch.cat(
+            [
+                positions[keep_t],
+                torch.as_tensor(
+                    child_positions, dtype=torch.float32, device=device
+                ),
+            ],
+            dim=0,
+        )
+        new_scales = torch.cat(
+            [
+                model.log_scales.detach()[keep_t],
+                torch.as_tensor(
+                    np.log(child_scales), dtype=torch.float32, device=device
+                ),
+            ],
+            dim=0,
+        )
+        new_opacities = torch.cat(
+            [
+                model.opacity_logits.detach()[keep_t],
+                child_opacity_logits,
+            ],
+            dim=0,
+        )
+        new_colors = torch.cat(
+            [
+                model.color_logits.detach()[keep_t],
+                child_colors,
+            ],
+            dim=0,
+        )
+        remove_mask = np.zeros(new_positions.shape[0], dtype=bool)
+        excess = int(new_positions.shape[0]) - max(0, int(max_splats))
+        if excess > 0:
+            old_opacity = torch.sigmoid(
+                model.opacity_logits.detach()[keep_t]
+            )
+            remove_old = min(excess, int(old_keep_indices.size))
+            old_order = torch.argsort(old_opacity).cpu().numpy()
+            remove_mask[old_keep_indices[old_order[:remove_old]]] = True
+            if excess > remove_old:
+                child_order = torch.argsort(
+                    torch.sigmoid(child_opacity_logits)
+                ).cpu().numpy()
+                child_start = int(old_keep_indices.size)
+                remove_mask[
+                    child_start + child_order[: excess - remove_old]
+                ] = True
+        remove_t = torch.as_tensor(
+            ~remove_mask, dtype=torch.bool, device=device
+        )
+        model.positions = torch.nn.Parameter(new_positions[remove_t])
+        model.log_scales = torch.nn.Parameter(new_scales[remove_t])
+        model.opacity_logits = torch.nn.Parameter(
+            new_opacities[remove_t]
+        )
+        model.color_logits = torch.nn.Parameter(new_colors[remove_t])
+        return (int(chosen_idx.size), True)
 
 
 def train_tfrf_splat(
@@ -3155,51 +3478,61 @@ def train_tfrf_splat(
                     and last_raw_holes >= scene_demand_hole_min
                     else 0
                 )
-                hole_budget = min(
-                    hole_fill_add + scene_hole_boost,
-                    max(0, current_cap - int(model.positions.shape[0])),
+                headroom = max(
+                    0, current_cap - int(model.positions.shape[0])
                 )
-                filled = False
-                raw_holes = 0
-                if hole_budget > 0:
-                    filled, raw_holes = _hole_fill_splats(
-                        model,
-                        camera,
-                        images[int(camera_choices[step])],
-                        background,
-                        near,
-                        far,
-                        device,
-                        rng,
-                        hole_budget,
-                        low_res=hole_fill_low_res,
-                        scale_ceiling=scale_upper,
-                        tile_pair_budget=tile_pair_budget,
-                        tile_max_splats=tile_max_splats,
-                        tile_work_budget=tile_work_budget,
-                        use_cuda_tile=use_cuda_tile,
-                        scale_px_factor=float(
-                            config.get("hole_fill_scale_px_factor", 1.2)
-                        ),
-                        median_scale_factor=float(
-                            config.get("hole_fill_median_scale_factor", 0.55)
-                        ),
-                        scale_ceiling_factor=float(
-                            config.get("hole_fill_scale_ceiling_factor", 1.4)
-                        ),
-                        opacity_center=float(
-                            config.get("hole_fill_opacity", 0.3)
-                        ),
-                        depth_ratios=tuple(
-                            float(value)
-                            for value in config.get(
-                                "hole_fill_depth_ratios",
-                                [0.97, 1.00, 1.03],
-                            )
-                        ),
-                        disk_cutoff=disk_cutoff,
-                        falloff_power=falloff_power,
+                depth_ratios = tuple(
+                    float(value)
+                    for value in config.get(
+                        "hole_fill_depth_ratios",
+                        [0.97, 1.00, 1.03],
                     )
+                )
+                demand_budget = (
+                    min(
+                        int(config.get("hole_fill_max_per_cycle", 20000)),
+                        max(0, last_raw_holes)
+                        * max(1, len(depth_ratios)),
+                    )
+                    if last_raw_holes > 0
+                    else 0
+                )
+                hole_budget = min(
+                    max(hole_fill_add + scene_hole_boost, demand_budget),
+                    headroom,
+                )
+                filled, raw_holes, hole_mask = _hole_fill_splats(
+                    model,
+                    camera,
+                    images[int(camera_choices[step])],
+                    background,
+                    near,
+                    far,
+                    device,
+                    rng,
+                    hole_budget,
+                    low_res=hole_fill_low_res,
+                    scale_ceiling=scale_upper,
+                    tile_pair_budget=tile_pair_budget,
+                    tile_max_splats=tile_max_splats,
+                    tile_work_budget=tile_work_budget,
+                    use_cuda_tile=use_cuda_tile,
+                    scale_px_factor=float(
+                        config.get("hole_fill_scale_px_factor", 1.2)
+                    ),
+                    median_scale_factor=float(
+                        config.get("hole_fill_median_scale_factor", 0.55)
+                    ),
+                    scale_ceiling_factor=float(
+                        config.get("hole_fill_scale_ceiling_factor", 1.4)
+                    ),
+                    opacity_center=float(
+                        config.get("hole_fill_opacity", 0.3)
+                    ),
+                    depth_ratios=depth_ratios,
+                    disk_cutoff=disk_cutoff,
+                    falloff_power=falloff_power,
+                )
                 if filled:
                     optimizer = build_optimizer()
                     grad_accum = torch.zeros(
@@ -3223,6 +3556,52 @@ def train_tfrf_splat(
                         f"[vram] step {step} 场景仍有 {raw_holes} 个空洞像素，"
                         f"棱面上限提升到 {scene_cap}"
                     )
+                if (
+                    raw_holes >= scene_demand_hole_min
+                    and hole_mask is not None
+                    and int(model.positions.shape[0]) >= current_cap - 1000
+                ):
+                    hole_split_count, hole_split_changed = (
+                        _split_splats_into_holes(
+                            model,
+                            camera,
+                            device,
+                            near,
+                            far,
+                            hole_mask,
+                            low_res=hole_fill_low_res,
+                            max_splits=int(
+                                config.get(
+                                    "hole_split_max_per_cycle", 2000
+                                )
+                            ),
+                            max_splats=current_cap,
+                            split_scale_factor=float(
+                                config.get(
+                                    "hole_split_scale_factor", 0.5
+                                )
+                            ),
+                            opacity_floor=float(
+                                config.get("hole_split_opacity", 0.3)
+                            ),
+                            children_per_split=int(
+                                config.get("hole_split_children", 4)
+                            ),
+                        )
+                    )
+                    if hole_split_changed:
+                        optimizer = build_optimizer()
+                        grad_accum = torch.zeros(
+                            len(model.positions),
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        rebuild_scale_targets()
+                        log(
+                            f"[train] step {step} 空洞拆入 "
+                            f"{hole_split_count} 组棱面，"
+                            f"当前 {len(model.positions)} 棱面"
+                        )
                 last_raw_holes = raw_holes
 
         log(f"[train] step {step + 1}/{steps} 用时 {time.time() - step_start:.2f}s")
@@ -3305,6 +3684,90 @@ def train_tfrf_splat(
                 },
             )
         status_after(project_dir, task_id)
+
+    if bool(config.get("final_cleanup", False)) and steps > 0:
+        final_depth_ratios = tuple(
+            float(value)
+            for value in config.get(
+                "hole_fill_depth_ratios",
+                [0.97, 1.00, 1.03],
+            )
+        )
+        final_fill_budget = min(
+            int(config.get("hole_fill_max_per_cycle", 20000)),
+            max(0, current_cap - int(model.positions.shape[0])),
+        )
+        final_filled, final_raw_holes, final_hole_mask = _hole_fill_splats(
+            model,
+            camera,
+            images[int(camera_choices[-1])],
+            background,
+            near,
+            far,
+            device,
+            rng,
+            final_fill_budget,
+            low_res=hole_fill_low_res,
+            scale_ceiling=scale_upper,
+            tile_pair_budget=tile_pair_budget,
+            tile_max_splats=tile_max_splats,
+            tile_work_budget=tile_work_budget,
+            use_cuda_tile=use_cuda_tile,
+            scale_px_factor=float(
+                config.get("hole_fill_scale_px_factor", 1.2)
+            ),
+            median_scale_factor=float(
+                config.get("hole_fill_median_scale_factor", 0.55)
+            ),
+            scale_ceiling_factor=float(
+                config.get("hole_fill_scale_ceiling_factor", 1.4)
+            ),
+            opacity_center=float(
+                config.get("hole_fill_opacity", 0.3)
+            ),
+            depth_ratios=final_depth_ratios,
+            disk_cutoff=disk_cutoff,
+            falloff_power=falloff_power,
+        )
+        if final_filled:
+            log(
+                f"[train] 最终补洞 {final_raw_holes} 个空洞像素，"
+                f"当前 {len(model.positions)} 棱面"
+            )
+        if (
+            final_raw_holes >= scene_demand_hole_min
+            and final_hole_mask is not None
+            and int(model.positions.shape[0]) >= current_cap - 1000
+        ):
+            final_split_count, final_split_changed = (
+                _split_splats_into_holes(
+                    model,
+                    camera,
+                    device,
+                    near,
+                    far,
+                    final_hole_mask,
+                    low_res=hole_fill_low_res,
+                    max_splits=int(
+                        config.get("hole_split_max_per_cycle", 2000)
+                    ),
+                    max_splats=current_cap,
+                    split_scale_factor=float(
+                        config.get("hole_split_scale_factor", 0.5)
+                    ),
+                    opacity_floor=float(
+                        config.get("hole_split_opacity", 0.3)
+                    ),
+                    children_per_split=int(
+                        config.get("hole_split_children", 4)
+                    ),
+                )
+            )
+            if final_split_changed:
+                log(
+                    f"[train] 最终空洞拆入 {final_split_count} 组棱面，"
+                    f"当前 {len(model.positions)} 棱面"
+                )
 
     if bool(config.get("final_cleanup", False)):
         with torch.no_grad():

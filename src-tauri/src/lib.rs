@@ -956,6 +956,14 @@ fn start_reconstruction(
             }
         }
     }
+    if let Some(user_max) = merged["max_splats"].as_u64() {
+        let absolute = merged["max_splats_absolute"]
+            .as_u64()
+            .unwrap_or(150_000);
+        if user_max > absolute {
+            merged["max_splats_absolute"] = json!(user_max);
+        }
+    }
 
     let engine_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

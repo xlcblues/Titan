@@ -2199,10 +2199,10 @@ def _hole_fill_splats(
     tile_max_splats: int = 8192,
     tile_work_budget: int = 2_000_000,
     use_cuda_tile: bool = True,
-    scale_px_factor: float = 1.2,
-    median_scale_factor: float = 0.55,
-    scale_ceiling_factor: float = 1.4,
-    opacity_center: float = 0.3,
+    scale_px_factor: float = 2.0,
+    median_scale_factor: float = 0.7,
+    scale_ceiling_factor: float = 4.0,
+    opacity_center: float = 0.35,
     depth_ratios: tuple[float, ...] = (0.90, 1.00, 1.10),
     disk_cutoff: float = 1.8,
     falloff_power: float = 1.0,
@@ -2372,7 +2372,7 @@ def _hole_fill_splats(
                 median_scale * max(float(median_scale_factor), 0.2),
             ),
             float(scale_floor),
-            min(
+            max(
                 float(scale_ceiling),
                 median_scale * max(float(scale_ceiling_factor), 1.0),
             ),
@@ -2930,7 +2930,7 @@ def train_tfrf_splat(
     reset_every = int(config.get("opacity_reset_every", 100))
     reset_opacity = float(config.get("opacity_reset_value", 0.7))
     scale_upper = max(
-        init_scale * float(config.get("scale_log_clamp", 4.0)),
+        init_scale * float(config.get("scale_log_clamp", 6.0)),
         float(config.get("scale_upper_floor", 0.2)),
     )
     ssim_loss_weight = float(config.get("ssim_loss_weight", 0.2))

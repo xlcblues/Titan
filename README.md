@@ -31,7 +31,7 @@ Titan 是面向 Windows 桌面端的三维重建软件，采用自研的 Facet R
 - 自动更新：使用 `tauri-plugin-updater`，签名公钥位于 `src-tauri/.updater/titan.key.pub`，私钥不提交。
 - 打包：`bundle.createUpdaterArtifacts` 已开启，构建时会同时生成安装包与更新签名产物。
 
-发布流程：先运行带签名环境变量的 `npm run tauri build`，再把生成的 `Titan_<version>_x64-setup.exe` 与 `.sig` 上传为 GitHub Release，并同步更新 `update/latest.json` 后推送。`plugins.updater.endpoints` 指向该 manifest 的 GitHub raw 地址，更新包使用同一把私钥签名。
+发布流程：先运行带签名环境变量的 `npm run tauri build`，再把生成的 `Titan_<version>_x64-setup.exe` 与 `.sig` 上传为 GitHub Release，并同步更新 `update/latest.json` 后推送。`plugins.updater.endpoints` 指向 GitHub Release 的 `latest.json` 资源地址，更新包使用同一把私钥签名。
 
 ## 本地开发
 

@@ -1,11 +1,11 @@
 {
-  "version": "0.1.2",
-  "notes": "Titan 0.1.2：仿照 Mars/Ceres 实现完整自动更新流程，进入设置页自动检查更新，支持下载进度与一键安装；GitHub 仓库已公开。",
-  "pub_date": "2026-11-02T03:41:24.154Z",
+  "version": "0.1.3",
+  "notes": "Titan 0.1.3：修复中途取消后无法重新训练的问题；训练进度每 10 步上报一次；放宽棱面尺寸限制并支持自定义数量；清理测试与无用文件。",
+  "pub_date": "2026-11-03T03:36:49.658Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUajRKTVc1c3JXdjJGQVc5TDNRYmpqeUVVV0YyUHVLQWl6V3lQSVp5ZHJUZHJ1dG1HUnNraUdqeUwxbWwyS0FCTHZjRTZCYUFmUVpnbmNjRS9ZZmlqZkVlMC9tTXlhS3d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNTkwODg0CWZpbGU6VGl0YW5fMC4xLjJfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMS4yCnZaK2ZTM1Nrd1hTSFZNb0dGZCt3cUY4YnR6VndwNjd1aHV4V1VweGNTVzRmS0Vxbml3QXNoRGxIazNwUUN5cjZZT3pjeW9kN1U5VU5NQVJkZkhWcUNnPT0K",
-      "url": "https://github.com/xlcblues/Titan/releases/download/v0.1.2/Titan_0.1.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUajRKTVc1c3JXdnhMMExqdzU3NDRBL3ExTyt1UloxRWZEMWlnWTdIK0w5OE85ZjFHM2d5RHJMWmJhNW9aSWx0WE1OTnV4TGg1aDhJUWh2cmRRM2JzTldzeThYQkk4REEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNjc3MDA5CWZpbGU6VGl0YW5fMC4xLjNfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMS4zCjlISE5KVlpIRkZqcFY4VGE5bFhOZFVacmFCQWkxUGJuVU04RjhJVFRlN2xGbG1yT0JxbHB3SXpFeDdxM0luQXN0enp2ZVBXeURmRytidGozY2tGeEJ3PT0K",
+      "url": "https://github.com/xlcblues/Titan/releases/download/v0.1.3/Titan_0.1.3_x64-setup.exe"
     }
   }
 }

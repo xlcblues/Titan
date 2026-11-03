@@ -1,6 +1,6 @@
 [package]
 name = "titan"
-version = "0.1.2"
+version = "0.1.3"
 description = "Titan: deep learning 3D reconstruction workstation"
 authors = ["Titan Team"]
 edition = "2024"

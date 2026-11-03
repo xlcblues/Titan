@@ -32,7 +32,7 @@ from .colmap_io import (
 from .colmap_sfm import run_colmap_sfm
 from .metrics import psnr as compute_psnr, ssim as compute_ssim
 from .synthetic import generate_scene, sphere_color_array
-from .tcf_engine import render_tcf_view, train_tcf
+from .tcf_engine import extract_dense_points, render_tcf_view, train_tcf
 
 
 SCENE_BACKGROUND = np.array([0.08, 0.09, 0.10], dtype=np.float32)
@@ -584,6 +584,7 @@ def write_scene_output(
     pose_source: str,
     cameras: list[dict],
     sparse_points: list[list[float]],
+    dense_points: list[float],
     final_metrics: dict,
     config: dict,
     history: list[dict],
@@ -598,6 +599,8 @@ def write_scene_output(
         "projectDir": str(project_dir),
         "poseSource": pose_source,
         "points": sparse_points,
+        "densePoints": dense_points,
+        "densePointCount": len(dense_points) // 6,
         "cameras": [
             {
                 "id": index,
@@ -616,7 +619,8 @@ def write_scene_output(
         "config": config,
     }
     (project_dir / "scene.json").write_text(
-        json.dumps(scene, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(scene, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
     )
     summary = {
         "taskId": task_id,
@@ -685,16 +689,6 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         return 0
     trained = trained_result["model"]
 
-    emit_status(
-        project_dir,
-        {
-            "taskId": task_id,
-            "status": "running",
-            "stage": "render",
-            "progress": 0.92,
-        },
-    )
-    render_paths: list[dict] = []
     scene_points_np = (
         np.asarray(sparse_points, dtype=np.float32)[:, :3]
         if sparse_points
@@ -707,6 +701,47 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
     coarse_samples = int(config.get("coarse_samples", 32))
     fine_samples = int(config.get("fine_samples", 16))
     use_amp = bool(config.get("mixed_precision", True))
+
+    emit_status(
+        project_dir,
+        {
+            "taskId": task_id,
+            "status": "running",
+            "stage": "extract",
+            "progress": 0.88,
+            "message": "正在提取三维稠密点云",
+        },
+    )
+    dense_points = extract_dense_points(
+        trained,
+        data["cameras"],
+        shift,
+        scale,
+        scene_points_np,
+        radius,
+        torch.device(device_name),
+        stride=int(config.get("dense_extract_stride", 4)),
+        ray_batch=ray_batch,
+        coarse_samples=coarse_samples,
+        fine_samples=fine_samples,
+        visibility_threshold=float(
+            config.get("dense_visibility_threshold", 0.2)
+        ),
+        max_points=int(config.get("dense_extract_max_points", 200000)),
+        use_amp=use_amp,
+    )
+    log(f"[extract] 稠密点云 {len(dense_points) // 6} 点")
+
+    emit_status(
+        project_dir,
+        {
+            "taskId": task_id,
+            "status": "running",
+            "stage": "render",
+            "progress": 0.92,
+        },
+    )
+    render_paths: list[dict] = []
 
     train_count = max(1, int(config.get("train_views", 16)))
     train_cameras = data["cameras"][:train_count]
@@ -802,6 +837,7 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         str(data.get("source", "orbit")),
         data["cameras"],
         sparse_points,
+        dense_points,
         final_metrics,
         config,
         history,

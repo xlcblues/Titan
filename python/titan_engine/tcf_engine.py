@@ -390,6 +390,70 @@ def render_rays_chunk(
     return rendered
 
 
+def render_rays_chunk_geometry(
+    model: TitanCoherenceField,
+    origins: torch.Tensor,
+    directions: torch.Tensor,
+    near: float,
+    far: float,
+    coarse_samples: int = 32,
+    fine_samples: int = 16,
+    readout_chunk: int = 131072,
+    use_amp: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Render one ray batch and also return the 3D vote position."""
+    device = origins.device
+    with torch.autocast("cuda", enabled=use_amp and device.type == "cuda"):
+        coarse_positions, inverse_depths = _sample_rays(
+            origins, directions, near, far, coarse_samples
+        )
+        coarse_logits = model.readout_logits(
+            coarse_positions.reshape(-1, 3),
+            directions.unsqueeze(1).expand_as(coarse_positions).reshape(-1, 3),
+            chunk=readout_chunk,
+        )
+        coarse_logits = coarse_logits.reshape(
+            origins.shape[0], coarse_samples, 5
+        )
+        coarse_color = torch.sigmoid(coarse_logits[..., 0:3])
+        coarse_coherence = coarse_logits[..., 3:4]
+        coarse_gates = torch.sigmoid(coarse_logits[..., 4:5])
+        coarse_weights = _voting_weights(coarse_coherence, coarse_gates)
+        expected_inverse = torch.sum(
+            coarse_weights * inverse_depths.unsqueeze(-1), dim=1
+        )
+
+        fine_positions, _ = _sample_rays(
+            origins,
+            directions,
+            near,
+            far,
+            fine_samples,
+            fine_inverse=expected_inverse,
+        )
+        fine_logits = model.readout_logits(
+            fine_positions.reshape(-1, 3),
+            directions.unsqueeze(1).expand_as(fine_positions).reshape(-1, 3),
+            chunk=readout_chunk,
+        )
+        fine_logits = fine_logits.reshape(origins.shape[0], fine_samples, 5)
+        fine_color = torch.sigmoid(fine_logits[..., 0:3])
+        fine_coherence = fine_logits[..., 3:4]
+        fine_gates = torch.sigmoid(fine_logits[..., 4:5])
+        fine_weights = _voting_weights(fine_coherence, fine_gates)
+
+        color = torch.sum(fine_weights * fine_color, dim=1)
+        weights_sum = fine_weights.sum(dim=1).clamp(min=1e-6)
+        expected_position = torch.sum(
+            fine_weights * fine_positions, dim=1
+        ) / weights_sum
+        visibility = fine_weights.sum(dim=1).clamp(max=1.0)
+        residual = torch.clamp(1.0 - visibility, min=0.0)
+        background = model.background.to(color.dtype)
+        rendered = color + residual * background
+    return rendered, expected_position, visibility
+
+
 def render_rays(
     model: TitanCoherenceField,
     origins: torch.Tensor,
@@ -508,6 +572,106 @@ def _ray_bounds(
     if not np.isfinite(lower) or not np.isfinite(upper) or upper <= 1e-6:
         return 0.3, 7.6
     return max(lower * 0.6, 0.05), upper * 1.5
+
+
+def _voxel_sample(points: np.ndarray, max_points: int) -> np.ndarray:
+    """Downsample a dense point cloud with a deterministic voxel grid."""
+    if len(points) <= max_points:
+        return points
+    lower = points[:, :3].min(axis=0)
+    upper = points[:, :3].max(axis=0)
+    span = np.maximum(upper - lower, 1e-6)
+    resolution = max(8, int(np.cbrt(max_points * 0.75)))
+    index = np.floor((points[:, :3] - lower) / span * resolution).astype(np.int64)
+    index = np.clip(index, 0, resolution - 1)
+    keys = (
+        index[:, 0] * resolution * resolution
+        + index[:, 1] * resolution
+        + index[:, 2]
+    )
+    _, first = np.unique(keys, return_index=True)
+    sampled = points[first]
+    if len(sampled) > max_points:
+        rng = np.random.default_rng(7)
+        sampled = sampled[rng.choice(len(sampled), max_points, replace=False)]
+    return sampled
+
+
+def extract_dense_points(
+    model: TitanCoherenceField,
+    cameras: list[dict],
+    shift: torch.Tensor,
+    scale: float,
+    scene_points: np.ndarray,
+    radius: float,
+    device: torch.device,
+    stride: int = 4,
+    ray_batch: int = 4096,
+    coarse_samples: int = 32,
+    fine_samples: int = 16,
+    visibility_threshold: float = 0.2,
+    max_points: int = 200000,
+    use_amp: bool = True,
+) -> list[float]:
+    """Extract a dense colored 3D point cloud from the trained field.
+
+    Each camera renders a subsampled ray grid and the expected vote position
+    of every ray is unprojected back into world space. Points are returned as
+    a flat [x, y, z, r, g, b, ...] array to keep scene.json compact.
+    """
+    model.to(device)
+    shift = shift.to(device)
+    chunks: list[np.ndarray] = []
+    with torch.no_grad():
+        for camera in cameras:
+            height, width = int(camera["height"]), int(camera["width"])
+            step = max(1, int(stride))
+            ys = np.arange(0, height, step)
+            xs = np.arange(0, width, step)
+            grid_y, grid_x = np.meshgrid(ys, xs, indexing="ij")
+            ys_flat = grid_y.reshape(-1)
+            xs_flat = grid_x.reshape(-1)
+            origins, directions = _camera_rays_from_pose(
+                camera, device, ys_flat, xs_flat
+            )
+            origins_scaled = (origins - shift) * scale
+            near, far = _ray_bounds(
+                origins_scaled, scene_points, radius, scale, shift
+            )
+            for start in range(0, origins_scaled.shape[0], ray_batch):
+                stop = min(start + ray_batch, origins_scaled.shape[0])
+                rendered, expected_position, visibility = (
+                    render_rays_chunk_geometry(
+                        model,
+                        origins_scaled[start:stop],
+                        directions[start:stop],
+                        near,
+                        far,
+                        coarse_samples=coarse_samples,
+                        fine_samples=fine_samples,
+                        use_amp=use_amp,
+                    )
+                )
+                rendered = rendered.float().cpu().numpy()
+                expected_position = expected_position.float().cpu().numpy()
+                visibility = visibility.float().cpu().numpy()[:, 0]
+                mask = visibility >= float(visibility_threshold)
+                if not mask.any():
+                    continue
+                positions_world = (
+                    expected_position[mask] / scale + shift.cpu().numpy()
+                )
+                colors = rendered[mask]
+                chunks.append(
+                    np.concatenate([positions_world, colors], axis=1).astype(
+                        np.float32
+                    )
+                )
+    if not chunks:
+        return []
+    points = np.concatenate(chunks, axis=0)
+    points = _voxel_sample(points, int(max_points))
+    return [float(value) for value in points.reshape(-1)]
 
 
 def train_tcf(

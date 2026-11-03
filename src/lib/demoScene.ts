@@ -5,16 +5,20 @@ export type SceneMode = "camera" | "points" | "mesh";
 export interface SceneBundle {
   group: THREE.Group;
   points: THREE.Points;
+  densePoints?: THREE.Points;
   mesh: THREE.Group;
   cameraPath: THREE.Group;
   markers: THREE.Sprite[];
   selection: THREE.Mesh;
   pointCount: number;
+  densePointCount: number;
   cameraCount: number;
   sceneCenter: THREE.Vector3;
   sceneRadius: number;
   pointCenter: THREE.Vector3;
   pointRadius: number;
+  denseCenter: THREE.Vector3;
+  denseRadius: number;
   cameraCenter: THREE.Vector3;
   cameraRadius: number;
   viewDirection: THREE.Vector3;
@@ -39,6 +43,8 @@ export interface TitanSceneData {
   projectDir?: string;
   poseSource?: string;
   points: number[][];
+  densePoints?: number[];
+  densePointCount?: number;
   cameras: TitanCamera[];
   renders?: { name: string; path: string; view: string }[];
   novelView?: string;
@@ -404,6 +410,45 @@ function buildTitanPoints(entries: number[][], radius: number): THREE.Points {
   return new THREE.Points(geometry, material);
 }
 
+function buildTitanDensePoints(
+  flat: number[],
+  radius: number,
+): THREE.Points {
+  const count = Math.floor(flat.length / 6);
+  const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  for (let i = 0; i < count; i += 1) {
+    const offset = i * 6;
+    positions[i * 3] = flat[offset];
+    positions[i * 3 + 1] = flat[offset + 1];
+    positions[i * 3 + 2] = flat[offset + 2];
+    const r = flat[offset + 3];
+    const g = flat[offset + 4];
+    const b = flat[offset + 5];
+    if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
+      colors[i * 3] = THREE.MathUtils.clamp(r, 0, 1);
+      colors[i * 3 + 1] = THREE.MathUtils.clamp(g, 0, 1);
+      colors[i * 3 + 2] = THREE.MathUtils.clamp(b, 0, 1);
+    } else {
+      const gold = new THREE.Color(GOLD);
+      colors[i * 3] = gold.r;
+      colors[i * 3 + 1] = gold.g;
+      colors[i * 3 + 2] = gold.b;
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  const material = new THREE.PointsMaterial({
+    size: Math.max(radius * 0.012, 0.06),
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.98,
+    sizeAttenuation: true,
+  });
+  return new THREE.Points(geometry, material);
+}
+
 function buildTitanCameraPath(
   cameras: TitanCamera[],
   cameraRadius: number,
@@ -628,6 +673,9 @@ export function createDemoScene(): SceneBundle {
     pointRadius: sceneRadius,
     cameraCenter: sceneCenter.clone(),
     cameraRadius: 4,
+    densePointCount: 0,
+    denseCenter: sceneCenter.clone(),
+    denseRadius: sceneRadius,
     viewDirection: new THREE.Vector3(0, 0, 1),
     setMode(mode) {
       const pointMaterial = points.material as THREE.PointsMaterial;
@@ -665,6 +713,11 @@ export function normalizeViewerY(scene: TitanSceneData): TitanSceneData {
   const flipY = scene.poseSource === "colmap" || scene.poseSource === "llff";
   if (!flipY) return scene;
   const flip = (values: number[]) => [values[0], -values[1], values[2]];
+  const densePoints = scene.densePoints
+    ? scene.densePoints.map((value, index) =>
+        index % 6 === 1 ? -value : value,
+      )
+    : undefined;
   return {
     ...scene,
     points: scene.points.map((point) => [
@@ -675,6 +728,7 @@ export function normalizeViewerY(scene: TitanSceneData): TitanSceneData {
       point[4],
       point[5],
     ]),
+    densePoints,
     cameras: scene.cameras.map((camera) => ({
       ...camera,
       position: flip(camera.position),
@@ -688,11 +742,18 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
   const viewerData = normalizeViewerY(data);
   const pointEntries = viewerData.points;
   const cameraEntries = viewerData.cameras;
+  const denseEntries = viewerData.densePoints ?? [];
   const pointBox = new THREE.Box3();
   const cameraBox = new THREE.Box3();
+  const denseBox = new THREE.Box3();
   pointEntries.forEach((point) => {
     pointBox.expandByPoint(new THREE.Vector3(point[0], point[1], point[2]));
   });
+  for (let i = 0; i + 5 < denseEntries.length; i += 6) {
+    denseBox.expandByPoint(
+      new THREE.Vector3(denseEntries[i], denseEntries[i + 1], denseEntries[i + 2]),
+    );
+  }
   cameraEntries.forEach((camera) => {
     cameraBox.expandByPoint(
       new THREE.Vector3(
@@ -737,6 +798,16 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
         Math.max(cameraSize.x, cameraSize.y, cameraSize.z) / 2,
         1e-3,
       );
+  const denseCenter = denseBox.isEmpty()
+    ? new THREE.Vector3()
+    : denseBox.getCenter(new THREE.Vector3()).sub(combinedCenter);
+  const denseSize = denseBox.getSize(new THREE.Vector3());
+  const denseRadius = denseBox.isEmpty()
+    ? 1
+    : Math.max(
+        Math.max(denseSize.x, denseSize.y, denseSize.z) / 2,
+        1e-3,
+      );
   const viewDirection = new THREE.Vector3();
   if (!pointBox.isEmpty() && !cameraBox.isEmpty()) {
     const pointMean = new THREE.Vector3();
@@ -755,6 +826,9 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
   }
 
   const points = buildTitanPoints(pointEntries, Math.max(pointRadius, 1e-3));
+  const densePoints = denseEntries.length
+    ? buildTitanDensePoints(denseEntries, Math.max(denseRadius, 1e-3))
+    : undefined;
   const mesh = buildTitanLattice(pointBox, sceneRadius, combinedCenter);
   const {
     path: cameraPath,
@@ -785,12 +859,16 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
   selection.visible = false;
 
   group.add(points, mesh, cameraPath, ground, selection);
+  if (densePoints) {
+    group.add(densePoints);
+  }
   group.position.copy(combinedCenter).multiplyScalar(-1);
 
   let viewCamera: THREE.PerspectiveCamera | null = null;
   const scene: SceneBundle = {
     group,
     points,
+    densePoints,
     mesh,
     cameraPath,
     markers,
@@ -803,13 +881,24 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
     pointRadius,
     cameraCenter,
     cameraRadius,
+    densePointCount: densePoints
+      ? densePoints.geometry.attributes.position.count
+      : 0,
+    denseCenter,
+    denseRadius,
     viewDirection,
     setMode(mode) {
       const pointMaterial = points.material as THREE.PointsMaterial;
       const isCameraMode = mode === "camera";
-      points.visible = mode === "points" || isCameraMode;
-      pointMaterial.opacity = isCameraMode ? 0.3 : 0.96;
-      mesh.visible = mode === "mesh";
+      const showDense = mode === "mesh" && Boolean(densePoints);
+      points.visible =
+        mode === "points" || isCameraMode || (mode === "mesh" && !densePoints);
+      pointMaterial.opacity =
+        isCameraMode ? 0.3 : showDense ? 0.16 : 0.96;
+      mesh.visible = mode === "mesh" && !densePoints;
+      if (densePoints) {
+        densePoints.visible = showDense;
+      }
       cameraPath.visible = isCameraMode;
       scanner.visible = isCameraMode;
       selection.visible = false;

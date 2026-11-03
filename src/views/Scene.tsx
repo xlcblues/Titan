@@ -70,6 +70,7 @@ export function Scene() {
   const [renderPage, setRenderPage] = useState(0);
   const [stats, setStats] = useState<SceneStats>({
     pointCount: 0,
+    densePointCount: 0,
     cameraCount: 0,
     selected: null,
     fps: 0,
@@ -305,7 +306,13 @@ export function Scene() {
             {activeMode.label}
           </span>
           <span className="scene-hud mono">
-            {stats.cameraCount} 相机 · {stats.pointCount.toLocaleString()} 点 ·{" "}
+            {stats.cameraCount} 相机 ·{" "}
+            {(
+              mode === "mesh" && stats.densePointCount > 0
+                ? stats.densePointCount
+                : stats.pointCount
+            ).toLocaleString()}{" "}
+            点 ·{" "}
             {Math.round(stats.fps)} FPS
           </span>
           <span className="scene-ratio mono">TITAN TCF</span>

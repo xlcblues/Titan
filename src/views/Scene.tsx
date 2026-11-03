@@ -155,15 +155,11 @@ export function Scene() {
         { label: "PSNR", value: formatMetric(metrics?.psnr, 2, " dB") },
         { label: "SSIM", value: formatMetric(metrics?.ssim, 3) },
         { label: "Loss", value: formatMetric(metrics?.loss, 4) },
-        { label: "显存峰值", value: formatMetric(metrics?.vramMB, 0, " MB") },
-        { label: "棱面", value: formatMetric(metrics?.splatCount, 0) },
+        { label: "当前显存", value: formatMetric(metrics?.vramMB, 0, " MB") },
+        { label: "相干格", value: formatMetric(metrics?.latticeMB, 1, " MB") },
         {
-          label: "棱面上限",
-          value: formatMetric(metrics?.splatLimit, 0),
-        },
-        {
-          label: "显存空闲",
-          value: formatMetric(metrics?.vramFreeMB, 0, " MB"),
+          label: "训练峰值",
+          value: formatMetric(metrics?.peakVramMB, 0, " MB"),
         },
         { label: "留出视图", value: formatMetric(metrics?.views, 0, " 视图") },
       ]
@@ -185,7 +181,7 @@ export function Scene() {
           label: realPose ? "完成" : "假设位姿",
           tone: realPose ? "success" as const : "warning" as const,
         },
-        { name: "TFRF 训练", label: "完成", tone: "success" as const },
+        { name: "TCF 训练", label: "完成", tone: "success" as const },
         { name: "渲染导出", label: "完成", tone: "success" as const },
       ]
     : [
@@ -194,7 +190,7 @@ export function Scene() {
           label: "完成",
           tone: "success" as const,
         },
-        { name: "TFRF 训练", label: "进行中", tone: "accent" as const },
+        { name: "TCF 训练", label: "进行中", tone: "accent" as const },
         { name: "渲染导出", label: "等待", tone: "neutral" as const },
       ];
 
@@ -318,7 +314,7 @@ export function Scene() {
             {stats.cameraCount} 相机 · {stats.pointCount.toLocaleString()} 点 ·{" "}
             {Math.round(stats.fps)} FPS
           </span>
-          <span className="scene-ratio mono">TITAN M4</span>
+          <span className="scene-ratio mono">TITAN TCF</span>
         </section>
 
         <div className="scene-side">

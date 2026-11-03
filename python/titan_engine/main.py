@@ -1,4 +1,9 @@
-"""Titan TFRF v0.1 reconstruction engine (subprocess sidecar)."""
+"""Titan Coherence Field (TCF) reconstruction engine (subprocess sidecar).
+
+TCF is a self-designed implicit scene representation: a multi-resolution
+coherence lattice plus a small shared readout network. Rendering casts
+coherence votes along rays instead of emitting discrete primitives.
+"""
 
 import argparse
 import json
@@ -14,13 +19,20 @@ from typing import Callable
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
+import torch
 from PIL import Image
 
 from . import __version__
+from .colmap_io import (
+    find_poses_bounds,
+    find_sparse_dir,
+    load_colmap_sparse,
+    load_llff_poses,
+)
 from .colmap_sfm import run_colmap_sfm
-from .colmap_io import find_poses_bounds, find_sparse_dir, load_colmap_sparse, load_llff_poses
 from .metrics import psnr as compute_psnr, ssim as compute_ssim
 from .synthetic import generate_scene, sphere_color_array
+from .tcf_engine import render_tcf_view, train_tcf
 
 
 SCENE_BACKGROUND = np.array([0.08, 0.09, 0.10], dtype=np.float32)
@@ -38,27 +50,6 @@ def emit_status(project_dir: Path, payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def emit_training_status(
-    project_dir: Path,
-    task_id: str,
-    step: int,
-    steps: int,
-    loss: float | None = None,
-) -> None:
-    emit_status(
-        project_dir,
-        {
-            "taskId": task_id,
-            "status": "running",
-            "stage": "training",
-            "progress": round(0.12 + 0.78 * ((step + 1) / steps), 4),
-            "step": step,
-            "totalSteps": steps,
-            "loss": None if loss is None else float(loss),
-        },
-    )
-
-
 def write_control(project_dir: Path, command: str) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "control.json").write_text(
@@ -73,22 +64,6 @@ def read_control(project_dir: Path) -> str | None:
         return json.loads(control.read_text(encoding="utf-8")).get("command")
     except (OSError, ValueError, KeyError):
         return None
-
-
-def encode_position(points: np.ndarray, levels: int) -> np.ndarray:
-    values = [points]
-    for level in range(levels):
-        values.append(np.sin((2.0**level) * math.pi * points))
-        values.append(np.cos((2.0**level) * math.pi * points))
-    return np.concatenate(values, axis=-1)
-
-
-def encode_direction(directions: np.ndarray, levels: int = 5) -> np.ndarray:
-    values = [directions]
-    for level in range(levels):
-        values.append(np.sin((2.0**level) * math.pi * directions))
-        values.append(np.cos((2.0**level) * math.pi * directions))
-    return np.concatenate(values, axis=-1)
 
 
 def load_pose_data(
@@ -409,10 +384,8 @@ def load_and_prepare_images(
 def build_sparse_points(cameras: list[dict], count: int = 2400) -> list[list[float]]:
     """Build an initialization cloud that follows the observed camera rays.
 
-    The baseline M3/M4 used a fixed synthetic sphere, which rendered as an
-    empty scene whenever the real cameras are far from the origin or observe
-    a much smaller object. This version triangulates camera ray pairs and
-    fills the volume that is actually visible from the cameras.
+    The cloud is only used for near/far estimation; TCF itself is implicit
+    and does not require an explicit primitive initialization.
     """
     count = max(int(count), 64)
     rng = np.random.default_rng(7)
@@ -420,7 +393,6 @@ def build_sparse_points(cameras: list[dict], count: int = 2400) -> list[list[flo
         [np.asarray(camera["c2w"], dtype=np.float32) for camera in cameras]
     )
     if cameras_np.ndim != 3 or cameras_np.shape[0] < 2:
-        # No real poses: keep the old sphere fallback at a neutral scale.
         directions = rng.normal(size=(count, 3))
         directions /= np.linalg.norm(directions, axis=1, keepdims=True)
         radii = 2.0 + 0.08 * rng.normal(size=(count, 1))
@@ -472,8 +444,6 @@ def build_sparse_points(cameras: list[dict], count: int = 2400) -> list[list[flo
         point = triangulate_pair(index_a, index_b)
         if point.size == 0:
             continue
-        # Keep points that land in front of both cameras and near their axes;
-        # this filters degenerate triangulations without requiring a sparse SfM.
         depth_a = float(
             np.dot(point[0] - positions[index_a], forwards[index_a])
         )
@@ -510,8 +480,6 @@ def build_sparse_points(cameras: list[dict], count: int = 2400) -> list[list[flo
         indices = rng.integers(0, len(anchors), size=count)
         points = anchors[indices] + rng.normal(scale=spread, size=(count, 3))
     else:
-        # Very few useful intersections: seed a shell at the typical distance
-        # in front of each camera so every view still has initial content.
         shells: list[np.ndarray] = []
         per_camera = max(4, count // max(cameras_count, 1))
         for index in range(cameras_count):
@@ -528,172 +496,6 @@ def build_sparse_points(cameras: list[dict], count: int = 2400) -> list[list[flo
     ]
 
 
-def scene_scale_from_cameras(cameras: list[dict]) -> float:
-    """Estimate a typical object distance from the camera layout."""
-    positions = np.asarray(
-        [np.asarray(camera["c2w"], dtype=np.float32)[:3, 3] for camera in cameras]
-    )
-    if len(positions) == 0:
-        return 1.0
-    centroid = np.mean(positions, axis=0)
-    median = float(np.median(np.linalg.norm(positions - centroid, axis=1)))
-    if not np.isfinite(median) or median <= 1e-6:
-        return 1.0
-    return median
-
-
-class FacetRadianceField:
-    def __init__(self, feature_dim: int = 66, hidden: int = 128) -> None:
-        self.hidden = hidden
-        # Points are rendered as soft faceted occupancy; the MLP predicts
-        # a radiance color for each query point.
-        self.feature = np.random.default_rng(11).normal(0.0, 0.08, size=(feature_dim, hidden))
-        self.bias_hidden = np.zeros(hidden, dtype=np.float32)
-        self.linear_out = np.random.default_rng(12).normal(0.0, 0.06, size=(hidden, 4))
-        # Initialize color to the synthetic background so early steps are
-        # near the constant background, then the field learns the object.
-        self.bias_out = np.array([-2.44, -2.31, -2.20, -3.0], dtype=np.float32)
-
-    def forward(
-        self, points: np.ndarray, directions: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        encoded = np.concatenate(
-            [encode_position(points, levels=5), encode_direction(directions)],
-            axis=-1,
-        )
-        hidden = np.tanh(encoded @ self.feature + self.bias_hidden)
-        out = hidden @ self.linear_out + self.bias_out
-        color = 1.0 / (1.0 + np.exp(-out[..., :3]))
-        density = 1.0 / (1.0 + np.exp(-out[..., 3:4]))
-        return color, density
-
-
-def render_rays(
-    model: FacetRadianceField,
-    origin: np.ndarray,
-    direction: np.ndarray,
-    near: float = 2.4,
-    far: float = 7.6,
-    samples: int = 48,
-    background: np.ndarray | None = None,
-) -> np.ndarray:
-    depth = np.linspace(near, far, samples)
-    points = origin[None, None, :] + depth[:, None, None] * direction[None, :, :]
-    directions = np.broadcast_to(direction[None, :, :], points.shape)
-    color, density = model.forward(points, directions)
-    alpha = 1.0 - np.exp(-0.24 * density)
-    transmittance = np.concatenate(
-        [np.ones_like(alpha[:1]), np.cumprod(1.0 - alpha + 1e-8, axis=0)[:-1]],
-        axis=0,
-    )
-    weights = alpha * transmittance
-    rendered = np.sum(weights * color, axis=0)
-    if background is not None:
-        rendered = rendered + (1.0 - np.sum(weights, axis=0)) * background
-    return rendered
-
-
-def ray_bounds_from_points(
-    origin: np.ndarray,
-    points: np.ndarray,
-    rotation: np.ndarray | None = None,
-    near_fraction: float = 0.6,
-    far_fraction: float = 1.5,
-) -> tuple[float, float]:
-    """Choose near/far from the actual point distribution seen by a camera."""
-    if len(points) == 0:
-        return 0.3, 7.6
-    points = np.asarray(points, dtype=np.float32)
-    origin = np.asarray(origin, dtype=np.float32)
-    if rotation is not None:
-        camera_space = (points - origin[None, :]) @ np.asarray(
-            rotation, dtype=np.float32
-        )
-        depths = camera_space[:, 2]
-        depths = depths[depths > 1e-4]
-    else:
-        depths = np.linalg.norm(points - origin[None, :], axis=1)
-    if depths.size == 0:
-        return 0.3, 7.6
-    lower = float(np.percentile(depths, 5.0))
-    upper = float(np.percentile(depths, 95.0))
-    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= 1e-6:
-        return 0.3, 7.6
-    near = max(lower * near_fraction, 1e-4)
-    far = max(upper * far_fraction, near * 1.2)
-    return near, far
-
-
-def render_view(
-    model: FacetRadianceField,
-    camera: dict,
-    background: np.ndarray,
-    scene_points: np.ndarray | None = None,
-    disk_cutoff: float = 2.2,
-    falloff_power: float = 1.0,
-    tile_size: int = 16,
-    dense_renderer: bool = False,
-    auto_dense_threshold: int = 20000,
-    auto_dense_pixels: int = 1_000_000,
-    tile_pair_budget: int = 4_000_000,
-    tile_max_splats: int = 8192,
-    tile_work_budget: int = 2_000_000,
-    use_cuda_tile: bool = False,
-    use_original_resolution: bool = False,
-) -> np.ndarray:
-    if hasattr(model, "positions") and hasattr(model, "color_logits"):
-        from .splat_engine import render_splats_view
-
-        render_camera = camera
-        if (
-            use_original_resolution
-            and camera.get("source_width")
-            and camera.get("source_height")
-        ):
-            render_camera = {
-                **camera,
-                "width": int(camera["source_width"]),
-                "height": int(camera["source_height"]),
-                "K": camera.get("source_K", camera["K"]),
-            }
-        return render_splats_view(
-            model,
-            render_camera,
-            background,
-            scene_points=scene_points,
-            disk_cutoff=disk_cutoff,
-            falloff_power=falloff_power,
-            tile_size=tile_size,
-            dense_renderer=dense_renderer,
-            auto_dense_threshold=auto_dense_threshold,
-            auto_dense_pixels=auto_dense_pixels,
-            tile_pair_budget=tile_pair_budget,
-            tile_max_splats=tile_max_splats,
-            tile_work_budget=tile_work_budget,
-            use_cuda_tile=use_cuda_tile,
-        )
-    c2w = np.asarray(camera["c2w"], dtype=np.float32)
-    k = camera["K"]
-    width, height = camera["width"], camera["height"]
-    fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
-    origin = c2w[:3, 3]
-    rotation = c2w[:3, :3]
-    ys, xs = np.mgrid[0:height, 0:width]
-    local = np.stack([(xs - cx) / fx, (ys - cy) / fy, np.ones_like(xs)], axis=-1)
-    directions = local @ rotation.T
-    directions = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
-    flat_dirs = directions.reshape(-1, 3)
-    near, far = (
-        ray_bounds_from_points(origin, scene_points, rotation=rotation)
-        if scene_points is not None and len(scene_points)
-        else (2.4, 7.6)
-    )
-    rendered = render_rays(
-        model, origin, flat_dirs, near=near, far=far, background=background
-    )
-    return rendered.reshape(height, width, 3)
-
-
 def compute_metrics(
     rendered: np.ndarray,
     ground_truth: np.ndarray,
@@ -705,61 +507,6 @@ def compute_metrics(
         "loss": mse,
         "psnr": compute_psnr(rendered, ground_truth),
         "ssim": compute_ssim(rendered, ground_truth),
-    }
-
-
-def prepare_device(config: dict) -> tuple[bool, str]:
-    try:
-        import torch
-    except ImportError:
-        return False, "numpy"
-    if torch.cuda.is_available():
-        try:
-            properties = torch.cuda.get_device_properties(0)
-            total_mb = int(properties.total_memory / (1024 * 1024))
-            log(f"[device] CUDA {properties.name} {total_mb} MiB")
-            return True, "torch"
-        except Exception:
-            return False, "numpy"
-    log("[device] CUDA 不可用，使用 CPU/torch 引擎")
-    return False, "torch"
-
-
-def status_after(project_dir: Path, task_id: str) -> None:
-    command = read_control(project_dir)
-    if command == "cancel":
-        emit_status(
-            project_dir,
-            {"taskId": task_id, "status": "cancelled", "stage": "cancel", "progress": 0.0},
-        )
-        sys.exit(0)
-    if command == "pause":
-        emit_status(
-            project_dir,
-            {"taskId": task_id, "status": "paused", "stage": "training", "progress": 0.0},
-        )
-        while read_control(project_dir) == "pause":
-            time.sleep(0.4)
-
-
-def orbit_camera(angle: float, size: int) -> dict:
-    position = np.array(
-        [5.4 * math.cos(angle), 1.35, 5.4 * math.sin(angle)], dtype=np.float64
-    )
-    forward = -position / np.linalg.norm(position)
-    up = np.array([0.0, 1.0, 0.0])
-    right = np.cross(up, forward)
-    right /= np.linalg.norm(right)
-    up = np.cross(forward, right)
-    c2w = np.eye(4)
-    c2w[:3, :3] = np.stack([right, up, forward], axis=1)
-    c2w[:3, 3] = position
-    focal = size * 1.15
-    return {
-        "width": size,
-        "height": size,
-        "K": [[focal, 0.0, size / 2.0], [0.0, focal, size / 2.0], [0.0, 0.0, 1.0]],
-        "c2w": c2w.tolist(),
     }
 
 
@@ -819,237 +566,6 @@ def orbit_camera_around_scene(
     }
 
 
-def train_tfrf(
-    images: np.ndarray,
-    cameras: list[dict],
-    config: dict,
-    project_dir: Path,
-    task_id: str,
-    device_name: str = "numpy",
-    sparse_points: list[list[float]] | None = None,
-) -> tuple[dict, list[dict]]:
-    engine = config.get("engine", "facets")
-    if engine == "facets":
-        from .splat_engine import train_tfrf_splat
-
-        return train_tfrf_splat(
-            images,
-            cameras,
-            config,
-            project_dir,
-            task_id,
-            sparse_points=sparse_points,
-        )
-    if device_name == "torch":
-        from .torch_engine import train_tfrf_torch
-
-        return train_tfrf_torch(
-            images,
-            cameras,
-            config,
-            project_dir,
-            task_id,
-            sparse_points=sparse_points,
-        )
-    train_count = int(config.get("train_views", 16))
-    steps = int(config.get("steps", 400))
-    patch = int(config.get("patch_size", 512))
-    eval_every = int(config.get("eval_every", 60))
-    training_progress_every = max(
-        1,
-        int(config.get("training_progress_every", config.get("progress_every", 10))),
-    )
-    sample_count = int(config.get("samples", 32))
-    scene_points = (
-        np.asarray(sparse_points, dtype=np.float32)[:, :3]
-        if sparse_points
-        else np.empty((0, 3), dtype=np.float32)
-    )
-
-    train_cameras = cameras[:train_count]
-    eval_cameras = cameras[train_count:]
-    if not eval_cameras:
-        eval_cameras = cameras[-1:]
-    background = SCENE_BACKGROUND
-    model = FacetRadianceField()
-    learning_rate = float(config.get("learning_rate", 0.003))
-    adam = {
-        "feature": {
-            "m": np.zeros_like(model.feature),
-            "v": np.zeros_like(model.feature),
-        },
-        "bias_hidden": {
-            "m": np.zeros_like(model.bias_hidden),
-            "v": np.zeros_like(model.bias_hidden),
-        },
-        "linear_out": {
-            "m": np.zeros_like(model.linear_out),
-            "v": np.zeros_like(model.linear_out),
-        },
-        "bias_out": {
-            "m": np.zeros_like(model.bias_out),
-            "v": np.zeros_like(model.bias_out),
-        },
-    }
-    beta1, beta2, epsilon = 0.9, 0.999, 1e-8
-    grad_clip = 1.0
-    camera_choices = np.random.default_rng(3).integers(
-        0, len(train_cameras), size=steps
-    )
-
-    log(f"[train] TFRF v0.1 开始，{len(train_cameras)} 训练视角，{steps} 步")
-    emit_training_status(project_dir, task_id, 0, steps)
-    history: list[dict] = []
-    start_wall = time.time()
-
-    for step in range(steps):
-        step_start = time.time()
-        camera = train_cameras[int(camera_choices[step])]
-        c2w = np.asarray(camera["c2w"], dtype=np.float32)
-        width, height = camera["width"], camera["height"]
-        origin = c2w[:3, 3]
-        rotation = c2w[:3, :3]
-        k = camera["K"]
-        fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
-
-        rng = np.random.default_rng(step)
-        ys = rng.integers(0, height, size=patch)
-        xs = rng.integers(0, width, size=patch)
-        local = np.stack([(xs - cx) / fx, (ys - cy) / fy, np.ones_like(xs)], axis=-1)
-        directions = local @ rotation.T
-        directions = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
-
-        near, far = ray_bounds_from_points(
-            origin, scene_points, rotation=rotation
-        )
-        rendered = render_rays(
-            model,
-            origin,
-            directions,
-            near=near,
-            far=far,
-            samples=sample_count,
-            background=background,
-        )
-        target = images[int(camera_choices[step])][ys, xs]
-        grad = 2.0 * (rendered - target)
-        loss = float(np.mean((rendered - target) ** 2))
-
-        depth = np.linspace(near, far, sample_count)
-        points = origin[None, None, :] + depth[:, None, None] * directions[None, :, :]
-        dirs = np.broadcast_to(directions[None, :, :], points.shape)
-        encoded = np.concatenate(
-            [encode_position(points, levels=5), encode_direction(dirs)],
-            axis=-1,
-        )
-        hidden = np.tanh(encoded @ model.feature + model.bias_hidden)
-        out = hidden @ model.linear_out + model.bias_out
-        color = 1.0 / (1.0 + np.exp(-out[..., :3]))
-        density = 1.0 / (1.0 + np.exp(-out[..., 3:4]))
-        alpha = 1.0 - np.exp(-0.24 * density)
-        transmittance = np.concatenate(
-            [np.ones_like(alpha[:1]), np.cumprod(1.0 - alpha + 1e-8, axis=0)[:-1]],
-            axis=0,
-        )
-        weights = alpha * transmittance
-
-        color_grad = weights * color * (1.0 - color) * grad[None, ...]
-        density_contribution = np.sum(
-            (color - rendered) * grad[None, ...], axis=-1, keepdims=True
-        )
-        density_grad = (
-            density
-            * (1.0 - density)
-            * 0.24
-            * weights
-            * (1.0 - alpha)
-            * density_contribution
-        )
-        out_grad = np.concatenate([color_grad, density_grad], axis=-1)
-
-        hidden_grad = out_grad @ model.linear_out.T
-        feature_grad = np.einsum("sni,snh->ih", encoded, hidden_grad)
-        linear_grad = np.einsum("snh,sno->ho", hidden, out_grad)
-        hidden_bias_grad = np.sum(hidden_grad, axis=(0, 1))
-        out_bias_grad = np.sum(out_grad, axis=(0, 1))
-
-        grads = {
-            "feature": feature_grad,
-            "bias_hidden": hidden_bias_grad,
-            "linear_out": linear_grad,
-            "bias_out": out_bias_grad,
-        }
-        norm_squared = sum(float(np.sum(g * g)) for g in grads.values())
-        norm = math.sqrt(norm_squared)
-        scale = 1.0 if norm < grad_clip else grad_clip / norm
-        t = step + 1
-        for name, gradient in grads.items():
-            gradient = gradient * scale
-            state = adam[name]
-            state["m"] = beta1 * state["m"] + (1.0 - beta1) * gradient
-            state["v"] = beta2 * state["v"] + (1.0 - beta2) * gradient * gradient
-            m_hat = state["m"] / (1.0 - beta1**t)
-            v_hat = state["v"] / (1.0 - beta2**t)
-            delta = learning_rate * m_hat / (np.sqrt(v_hat) + epsilon)
-            if name == "feature":
-                model.feature = model.feature - delta
-            elif name == "bias_hidden":
-                model.bias_hidden = model.bias_hidden - delta
-            elif name == "linear_out":
-                model.linear_out = model.linear_out - delta
-            else:
-                model.bias_out = model.bias_out - delta
-
-        log(f"[train] step {step + 1}/{steps} 用时 {time.time() - step_start:.2f}s")
-        if step % training_progress_every == 0:
-            emit_training_status(project_dir, task_id, step, steps, loss)
-        if step % eval_every == 0 or step == steps - 1:
-            eval_index = (step // eval_every) % len(eval_cameras)
-            eval_camera = eval_cameras[eval_index]
-            rendered_view = render_view(
-                model,
-                eval_camera,
-                background,
-                scene_points=scene_points,
-                disk_cutoff=float(config.get("disk_cutoff", 2.2)),
-                falloff_power=float(config.get("falloff_power", 1.0)),
-            )
-            target_view = images[len(cameras) - len(eval_cameras) + eval_index]
-            metrics = compute_metrics(rendered_view, target_view)
-            metrics.update(
-                {
-                    "step": step,
-                    "totalSteps": steps,
-                    "vramMB": 0,
-                    "elapsed": round(time.time() - start_wall, 2),
-                }
-            )
-            history.append(metrics)
-            log(
-                f"[train] step {step} loss {metrics['loss']:.5f} "
-                f"psnr {metrics['psnr']:.2f}"
-            )
-            emit_status(
-                project_dir,
-                {
-                    "taskId": task_id,
-                    "status": "running",
-                    "stage": "training",
-                    "progress": round(0.12 + 0.78 * ((step + 1) / steps), 4),
-                    "step": step,
-                    "totalSteps": steps,
-                    "loss": metrics["loss"],
-                    "psnr": metrics["psnr"],
-                    "ssim": metrics["ssim"],
-                    "vramMB": metrics["vramMB"],
-                    "metrics": history,
-                },
-            )
-        status_after(project_dir, task_id)
-
-    return {"model": model, "history": history}, history
-
-
 def write_render(
     project_dir: Path,
     name: str,
@@ -1073,10 +589,10 @@ def write_scene_output(
     history: list[dict],
     render_paths: list[dict],
     novel_path: str,
-    engine: str = "facets",
+    engine: str = "tcf",
 ) -> None:
     scene = {
-        "version": "0.1.0",
+        "version": "0.2.0",
         "engine": engine,
         "taskId": task_id,
         "projectDir": str(project_dir),
@@ -1144,29 +660,18 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         raise RuntimeError("项目没有可用图片或位姿")
     images = load_and_prepare_images(data["images"], data["cameras"], config)
     train_resolution_note = (
-        "（原分辨率）"
-        if config.get("train_original_resolution")
-        else ""
+        "（原分辨率）" if config.get("train_original_resolution") else ""
     )
     log(
         f"[data] 图片 {len(data['images'])} 张，"
         f"训练尺寸 {images.shape[1]}x{images.shape[2]}{train_resolution_note}"
     )
 
-    _, device_name = prepare_device(config)
+    device_name = "cuda" if torch.cuda.is_available() else "cpu"
     sparse_points = data["points"] or build_sparse_points(data["cameras"])
     log(f"[data] 稀疏点云 {len(sparse_points)} 点，设备 {device_name}")
 
-    emit_status(
-        project_dir,
-        {
-            "taskId": task_id,
-            "status": "running",
-            "stage": "training",
-            "progress": 0.12,
-        },
-    )
-    trained_result, history = train_tfrf(
+    trained_result, history = train_tcf(
         images,
         data["cameras"],
         config,
@@ -1174,7 +679,10 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         task_id=task_id,
         device_name=device_name,
         sparse_points=sparse_points,
+        status_cb=lambda payload: emit_status(project_dir, payload),
     )
+    if trained_result.get("cancelled"):
+        return 0
     trained = trained_result["model"]
 
     emit_status(
@@ -1186,31 +694,36 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
             "progress": 0.92,
         },
     )
-    background = SCENE_BACKGROUND
     render_paths: list[dict] = []
     scene_points_np = (
         np.asarray(sparse_points, dtype=np.float32)[:, :3]
         if sparse_points
         else np.empty((0, 3), dtype=np.float32)
     )
-    train_count = int(config.get("train_views", 16))
+    shift = trained_result["shift"]
+    scale = float(trained_result["scale"])
+    radius = float(trained_result["radius"])
+    ray_batch = int(config.get("ray_batch_size", 4096))
+    coarse_samples = int(config.get("coarse_samples", 32))
+    fine_samples = int(config.get("fine_samples", 16))
+    use_amp = bool(config.get("mixed_precision", True))
+
+    train_count = max(1, int(config.get("train_views", 16)))
     train_cameras = data["cameras"][:train_count]
+    if not train_cameras:
+        train_cameras = data["cameras"][:1]
     for camera_index, camera in enumerate(train_cameras):
-        rendered = render_view(
+        rendered = render_tcf_view(
             trained,
             camera,
-            background,
-            scene_points=scene_points_np,
-            disk_cutoff=float(config.get("disk_cutoff", 2.2)),
-            falloff_power=float(config.get("falloff_power", 1.0)),
-            tile_size=int(config.get("render_tile_size", 16)),
-            dense_renderer=bool(config.get("dense_renderer", False)),
-            auto_dense_threshold=int(config.get("auto_dense_threshold", 20000)),
-            auto_dense_pixels=int(config.get("auto_dense_pixels", 1_000_000)),
-            tile_pair_budget=int(config.get("tile_pair_budget", 4_000_000)),
-            tile_max_splats=int(config.get("tile_max_splats", 8192)),
-            tile_work_budget=int(config.get("tile_work_budget", 2_000_000)),
-            use_cuda_tile=bool(config.get("use_cuda_tile", True)),
+            shift,
+            scale,
+            scene_points_np,
+            radius,
+            ray_batch=ray_batch,
+            coarse_samples=coarse_samples,
+            fine_samples=fine_samples,
+            use_amp=use_amp,
         )
         path = write_render(project_dir, f"render_train_{camera_index:03d}.png", rendered)
         render_paths.append(
@@ -1220,25 +733,19 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
     heldout = data["cameras"][train_count:]
     if not heldout:
         heldout = data["cameras"][-1:]
-    heldout_scores = []
-    render_original = bool(config.get("render_original_resolution", True))
+    heldout_scores: list[dict] = []
     for index, camera in enumerate(heldout):
-        rendered = render_view(
+        rendered = render_tcf_view(
             trained,
             camera,
-            background,
-            scene_points=scene_points_np,
-            disk_cutoff=float(config.get("disk_cutoff", 2.2)),
-            falloff_power=float(config.get("falloff_power", 1.0)),
-            tile_size=int(config.get("render_tile_size", 16)),
-            dense_renderer=bool(config.get("dense_renderer", False)),
-            auto_dense_threshold=int(config.get("auto_dense_threshold", 20000)),
-            auto_dense_pixels=int(config.get("auto_dense_pixels", 1_000_000)),
-            tile_pair_budget=int(config.get("tile_pair_budget", 4_000_000)),
-            tile_max_splats=int(config.get("tile_max_splats", 8192)),
-            tile_work_budget=int(config.get("tile_work_budget", 2_000_000)),
-            use_cuda_tile=bool(config.get("use_cuda_tile", True)),
-            use_original_resolution=render_original,
+            shift,
+            scale,
+            scene_points_np,
+            radius,
+            ray_batch=ray_batch,
+            coarse_samples=coarse_samples,
+            fine_samples=fine_samples,
+            use_amp=use_amp,
         )
         path = write_render(project_dir, f"render_eval_{index:03d}.png", rendered)
         render_paths.append(
@@ -1252,9 +759,7 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
                 np.asarray(
                     Image.fromarray(
                         (np.clip(metric_rendered, 0.0, 1.0) * 255.0).astype(np.uint8)
-                    ).resize(
-                        (target.shape[1], target.shape[0]), Image.LANCZOS
-                    ),
+                    ).resize((target.shape[1], target.shape[0]), Image.LANCZOS),
                     dtype=np.float32,
                 )
                 / 255.0
@@ -1267,21 +772,17 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         scene_points=scene_points_np,
         cameras=data["cameras"],
     )
-    rendered = render_view(
+    rendered = render_tcf_view(
         trained,
         novel,
-        background,
-        scene_points=scene_points_np,
-        disk_cutoff=float(config.get("disk_cutoff", 2.2)),
-        falloff_power=float(config.get("falloff_power", 1.0)),
-        tile_size=int(config.get("render_tile_size", 16)),
-        dense_renderer=bool(config.get("dense_renderer", False)),
-        auto_dense_threshold=int(config.get("auto_dense_threshold", 20000)),
-        auto_dense_pixels=int(config.get("auto_dense_pixels", 1_000_000)),
-        tile_pair_budget=int(config.get("tile_pair_budget", 4_000_000)),
-        tile_max_splats=int(config.get("tile_max_splats", 8192)),
-        tile_work_budget=int(config.get("tile_work_budget", 2_000_000)),
-        use_cuda_tile=bool(config.get("use_cuda_tile", True)),
+        shift,
+        scale,
+        scene_points_np,
+        radius,
+        ray_batch=ray_batch,
+        coarse_samples=coarse_samples,
+        fine_samples=fine_samples,
+        use_amp=use_amp,
     )
     novel_path = write_render(project_dir, "novel_orbit.png", rendered)
 
@@ -1290,14 +791,11 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         "ssim": float(np.mean([item["ssim"] for item in heldout_scores])),
         "loss": float(np.mean([item["loss"] for item in heldout_scores])),
         "vramMB": int(history[-1]["vramMB"]) if history else 0,
+        "latticeMB": float(trained_result.get("latticeMB", 0.0)),
+        "peakVramMB": int(trained_result.get("peakVramMB", 0)),
         "views": len(heldout_scores),
-        "splatCount": int(trained.positions.shape[0])
-        if hasattr(trained, "positions")
-        else 0,
-        "splatLimit": int(history[-1].get("splatLimit", 0)) if history else 0,
-        "vramFreeMB": int(history[-1].get("vramFreeMB", 0)) if history else 0,
     }
-    engine = trained_result.get("engine", "facets") if isinstance(trained_result, dict) else "facets"
+    engine = trained_result.get("engine", "tcf")
     write_scene_output(
         project_dir,
         task_id,
@@ -1311,14 +809,14 @@ def run(project_dir: Path, task_id: str, config: dict) -> int:
         novel_path,
         engine=engine,
     )
-    log("[done] 端到端重建完成")
+    log("[done] TCF 端到端重建完成")
     return 0
 
 
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="Titan TFRF reconstruction engine")
+    parser = argparse.ArgumentParser(description="Titan Coherence Field engine")
     parser.add_argument("--project-dir", required=True)
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--config-json", default="{}")
@@ -1339,7 +837,6 @@ def main() -> None:
         import traceback
 
         traceback.print_exc()
-        log(f"[error] {error}")
         sys.exit(1)
 
 

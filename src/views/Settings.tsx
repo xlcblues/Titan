@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from "react";
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ChevronDown,
@@ -14,8 +14,6 @@ import { ThemeToggle } from "../components/ThemeToggle";
 import { useAppInfo } from "../hooks/useAppInfo";
 import {
   readReconstructionSettings,
-  MAX_SPLATS_MAX,
-  MAX_SPLATS_MIN,
   TRAINING_QUALITY_OPTIONS,
   TRAINING_STEPS_MAX,
   TRAINING_STEPS_MIN,
@@ -228,39 +226,6 @@ export function Settings() {
                 }}
                 aria-label="训练步数"
               />
-            </div>
-            <div className="field-row">
-              <span className="field-row__label">棱面上限</span>
-              <div className="field-row__control">
-                <input
-                  className="field-row__range"
-                  type="range"
-                  min={MAX_SPLATS_MIN}
-                  max={MAX_SPLATS_MAX}
-                  step={5000}
-                  value={settings.maxSplats}
-                  onChange={(event) => {
-                    const next = {
-                      ...settings,
-                      maxSplats: Number(event.currentTarget.value),
-                    };
-                    setSettings(next);
-                    writeReconstructionSettings(next);
-                  }}
-                  style={
-                    {
-                      "--split-fill": `${((settings.maxSplats -
-                        MAX_SPLATS_MIN) /
-                        (MAX_SPLATS_MAX - MAX_SPLATS_MIN)) *
-                        100}%`,
-                    } as CSSProperties
-                  }
-                  aria-label="棱面上限"
-                />
-                <span className="info-row__value mono">
-                  {settings.maxSplats.toLocaleString()}
-                </span>
-              </div>
             </div>
             <div className="field-row">
               <span className="field-row__label">混合精度</span>

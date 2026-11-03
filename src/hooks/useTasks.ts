@@ -10,10 +10,8 @@ export interface TaskMetrics {
   ssim?: number;
   lpips?: number;
   vramMB?: number;
-  vramFreeMB?: number;
-  vramPressure?: number;
-  splatLimit?: number;
-  splatCount?: number;
+  latticeMB?: number;
+  peakVramMB?: number;
   elapsed?: number;
 }
 
@@ -44,10 +42,8 @@ interface TaskEventPayload {
   psnr?: number;
   ssim?: number;
   vramMB?: number;
-  vramFreeMB?: number;
-  vramPressure?: number;
-  splatLimit?: number;
-  splatCount?: number;
+  latticeMB?: number;
+  peakVramMB?: number;
   metrics?: TaskMetrics[];
 }
 
@@ -123,12 +119,10 @@ export function useTasks(projectId: string) {
                 psnr: payload.psnr,
                 ssim: payload.ssim,
                 vramMB: payload.vramMB ?? current.latest?.vramMB,
-                vramFreeMB:
-                  payload.vramFreeMB ?? current.latest?.vramFreeMB,
-                vramPressure:
-                  payload.vramPressure ?? current.latest?.vramPressure,
-                splatLimit: payload.splatLimit ?? current.latest?.splatLimit,
-                splatCount: payload.splatCount ?? current.latest?.splatCount,
+                latticeMB:
+                  payload.latticeMB ?? current.latest?.latticeMB,
+                peakVramMB:
+                  payload.peakVramMB ?? current.latest?.peakVramMB,
                 totalSteps:
                   payload.totalSteps ?? current.latest?.totalSteps,
               };

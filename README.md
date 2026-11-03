@@ -1,6 +1,6 @@
 # Titan
 
-Titan 是面向 Windows 桌面端的三维重建软件，采用自研的 Facet Radiance Field 深度学习方法，定位与 3DGS、NeRF 同类，并与 Mars、Ceres、Neptune 构成同系列产品体系。
+Titan 是面向 Windows 桌面端的三维重建软件，采用完全自研的隐式重建算法 Titan Coherence Field（TCF）：以多分辨率相干格作为场景记忆，以小共享读出网络解码外观，以光线相干投票完成渲染。Titan 与 Mars、Ceres、Neptune 构成同系列产品体系。
 
 ## 特性
 
@@ -54,7 +54,7 @@ cargo check
 ```text
 src/          前端 React 应用
 src-tauri/    Rust / Tauri 后端
-python/       Python 重建引擎（TFRF）
+python/       Python 重建引擎（TCF）
 design/       Logo、UI 规范与设计预览
 docs/         技术选型、开发流程与算法方案
 assets/logo/  Logo 源文件

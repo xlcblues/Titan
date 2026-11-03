@@ -247,21 +247,12 @@ fn write_control(project_dir: &Path, command: &str) -> Result<(), String> {
     fs::write(project_dir.join("control.json"), raw).map_err(|error| error.to_string())
 }
 
-fn clean_tile_build_locks(build_dir: &Path) {
-    for name in ["lock", ".ninja_lock"] {
-        let path = build_dir.join(name);
-        if path.is_file() {
-            let _ = fs::remove_file(&path);
-        }
-    }
-}
-
 #[tauri::command]
 fn app_info() -> AppInfo {
     AppInfo {
         name: "Titan",
         version: env!("CARGO_PKG_VERSION"),
-        engine: "Facet Radiance Field",
+        engine: "Titan Coherence Field (TCF)",
         gpu_budget: "8GB",
         target_platform: "Windows",
     }
@@ -861,87 +852,33 @@ fn start_reconstruction(
     .map_err(|error| error.to_string())?;
 
     let mut merged = json!({
-        "engine": "facets",
+        "engine": "tcf",
         "resolution": 192,
         "steps": 1200,
         "train_views": 16,
         "patch_size": 1024,
         "eval_every": 100,
         "training_progress_every": 10,
-        "learning_rate": 0.02,
+        "learning_rate": 0.01,
+        "learning_rate_end": 0.002,
+        "lattice_levels": 8,
+        "lattice_base_resolution": 32,
+        "lattice_scale": 1.6,
+        "lattice_max_resolution": 512,
+        "lattice_entries": 131072,
+        "lattice_feature_dim": 4,
+        "position_levels": 4,
+        "direction_levels": 2,
+        "readout_hidden": 64,
+        "mixed_precision": true,
+        "ray_batch_size": 4096,
+        "coarse_samples": 32,
+        "fine_samples": 16,
+        "readout_chunk": 131072,
         "gpu_budget": 8,
-        "render_batch_size": 256,
-        "render_tile_size": 16,
-        "dense_renderer": false,
-        "auto_dense_threshold": 20000,
-        "auto_dense_pixels": 1000000,
         "train_original_resolution": true,
         "train_max_image_pixels": 2000000,
-        "tile_pair_budget": 4000000,
-        "tile_work_budget": 32000000,
-        "tile_max_splats": 8192,
-        "max_splats": 80000,
-        "max_splats_absolute": 150000,
-        "adaptive_budget": true,
-        "budget_check_every": 20,
-        "vram_headroom_mb": 1200,
-        "vram_low_mb": 2200,
-        "vram_critical_mb": 1400,
-        "splat_mb_estimate": 0.012,
-        "adaptive_min_splats": 30000,
-        "vram_tight_tile_pair_budget": 2000000,
-        "vram_tight_tile_work_budget": 12000000,
-        "vram_tight_tile_max_splats": 4096,
-        "vram_critical_tile_pair_budget": 1200000,
-        "vram_critical_tile_max_splats": 3072,
-        "vram_prune_opacity": 0.12,
-        "scene_cap_boost": 10000,
-        "scene_demand_hole_min": 200,
-        "hole_fill_add_scene_boost": 4000,
         "sparse_points_limit": 50000,
-        "render_original_resolution": true,
-        "global_residual_resolution": 16,
-        "global_residual_weight": 0.6,
-        "init_target_px": 1.3,
-        "init_opacity": 0.45,
-        "surface_prior_weight": 0.015,
-        "scale_prior_weight": 0.01,
-        "ssim_loss_weight": 0.3,
-        "ssim_window_size": 9,
-        "projected_scale_prior_weight": 0.02,
-        "projected_scale_target_px": 1.5,
-        "split_large_splats": true,
-        "split_after": 200,
-        "split_every": 50,
-        "split_scale_factor": 0.55,
-        "split_min_projected_px": 2.0,
-        "split_max_per_cycle": 4000,
-        "split_children": 4,
-        "split_shrink_factor": 0.85,
-        "opacity_reset_value": 0.45,
-        "scale_log_clamp": 2.5,
-        "ray_cover_points": 6000,
-        "hole_fill": true,
-        "hole_fill_after": 100,
-        "hole_fill_every": 20,
-        "hole_fill_add": 2800,
-        "hole_fill_resolution": 192,
-        "hole_fill_scale_px_factor": 1.1,
-        "hole_fill_median_scale_factor": 0.45,
-        "hole_fill_scale_ceiling_factor": 1.2,
-        "hole_fill_opacity": 0.25,
-        "hole_fill_depth_ratios": [0.97, 1.0, 1.03],
-        "opacity_concentration_weight": 0.04,
-        "far_prune": true,
-        "far_prune_after": 120,
-        "far_prune_every": 20,
-        "far_prune_opacity": 0.3,
-        "far_prune_max_ratio": 0.7,
-        "far_prune_keep_min_fraction": 0.15,
-        "final_cleanup": true,
-        "background_residual_weight": 0.0,
-        "disk_cutoff": 1.7,
-        "falloff_power": 1.2,
         "pose_source": "auto",
         "colmap_path": "",
         "sfm_matcher": "sequential",
@@ -966,24 +903,6 @@ fn start_reconstruction(
         return Err(format!("未找到 Python 引擎：{}", engine_root.display()));
     }
     let python = resolve_python()?;
-    let has_running_task = {
-        let registry = app.state::<TaskRegistry>();
-        let mut guard = registry.0.lock().unwrap();
-        guard.iter_mut().any(|(_, child)| {
-            child
-                .try_wait()
-                .map(|status| status.is_none())
-                .unwrap_or(false)
-        })
-    };
-    if !has_running_task {
-        clean_tile_build_locks(
-            &engine_root
-                .join("titan_engine")
-                .join("tile_cuda")
-                .join("build"),
-        );
-    }
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let now = now_millis();

@@ -11,8 +11,8 @@ export interface AppInfo {
 
 const FALLBACK: AppInfo = {
   name: "Titan",
-  version: "0.1.3",
-  engine: "Facet Radiance Field",
+  version: "0.2.0",
+  engine: "Titan Coherence Field (TCF)",
   gpuBudget: "8GB",
   targetPlatform: "Windows",
 };

@@ -172,7 +172,7 @@ def generate_scene(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate a synthetic TFRF test scene")
+    parser = argparse.ArgumentParser(description="Generate a synthetic TCF test scene")
     parser.add_argument("--out", required=True)
     parser.add_argument("--count", type=int, default=24)
     parser.add_argument("--size", type=int, default=256)

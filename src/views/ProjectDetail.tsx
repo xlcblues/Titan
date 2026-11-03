@@ -60,7 +60,7 @@ function stageLabel(stage: string | undefined) {
   const labels: Record<string, string> = {
     data: "数据准备",
     sfm: "COLMAP 位姿估计",
-    training: "TFRF 训练",
+    training: "TCF 训练",
     render: "渲染导出",
     done: "完成",
     error: "错误",
@@ -73,19 +73,6 @@ function formatMetric(value: number | undefined, digits: number, suffix = "") {
   return typeof value === "number" && Number.isFinite(value)
     ? `${value.toFixed(digits)}${suffix}`
     : "—";
-}
-
-function formatCount(value: number | undefined) {
-  return typeof value === "number" && Number.isFinite(value)
-    ? Math.round(value).toLocaleString()
-    : "—";
-}
-
-function vramPressureLabel(value: number | undefined) {
-  if (value === 0) return "正常";
-  if (value === 1) return "紧张";
-  if (value === 2) return "告警";
-  return "—";
 }
 
 export function ProjectDetail() {
@@ -463,22 +450,15 @@ export function ProjectDetail() {
               </span>
             </div>
             <div className="metric-row">
-              <span className="metric-row__label">棱面</span>
+              <span className="metric-row__label">相干格</span>
               <span className="metric-row__value mono">
-                {formatCount(task?.latest?.splatCount)} /{" "}
-                {formatCount(task?.latest?.splatLimit)}
+                {formatMetric(task?.latest?.latticeMB, 1, " MB")}
               </span>
             </div>
             <div className="metric-row">
-              <span className="metric-row__label">显存空闲</span>
+              <span className="metric-row__label">训练峰值</span>
               <span className="metric-row__value mono">
-                {formatMetric(task?.latest?.vramFreeMB, 0, " MB")}
-              </span>
-            </div>
-            <div className="metric-row">
-              <span className="metric-row__label">显存压力</span>
-              <span className="metric-row__value mono">
-                {vramPressureLabel(task?.latest?.vramPressure)}
+                {formatMetric(task?.latest?.peakVramMB, 0, " MB")}
               </span>
             </div>
           </div>

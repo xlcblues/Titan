@@ -109,6 +109,7 @@ export function reconstructionConfig(
     tile_max_splats: 8192,
     max_splats: settings.maxSplats,
     steps: settings.steps,
+    training_progress_every: 10,
     disk_cutoff: 1.7,
     falloff_power: 1.2,
     far_prune: true,

@@ -2364,7 +2364,7 @@ def train_tfrf_splat(
     eval_every = int(config.get("eval_every", 100))
     training_progress_every = max(
         1,
-        int(config.get("training_progress_every", config.get("progress_every", 1))),
+        int(config.get("training_progress_every", config.get("progress_every", 10))),
     )
     learning_rate = float(config.get("learning_rate", 0.02))
     render_batch = int(config.get("render_batch_size", 256))
@@ -3227,13 +3227,7 @@ def train_tfrf_splat(
 
         log(f"[train] step {step + 1}/{steps} 用时 {time.time() - step_start:.2f}s")
         if step % training_progress_every == 0:
-            emit_training_status(
-                project_dir,
-                task_id,
-                step,
-                steps,
-                float(loss.detach().cpu()),
-            )
+            emit_training_status(project_dir, task_id, step, steps)
         if step % eval_every == 0 or step == steps - 1:
             eval_index = (step // eval_every) % len(eval_cameras)
             eval_camera = eval_cameras[eval_index]

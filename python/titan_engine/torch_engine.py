@@ -258,13 +258,7 @@ def train_tfrf_torch(
 
         log(f"[train] step {step + 1}/{steps} 用时 {time.time() - step_start:.2f}s")
         if step % training_progress_every == 0:
-            emit_training_status(
-                project_dir,
-                task_id,
-                step,
-                steps,
-                float(loss.detach().cpu()),
-            )
+            emit_training_status(project_dir, task_id, step, steps)
         if step % eval_every == 0 or step == steps - 1:
             eval_index = (step // eval_every) % len(eval_cameras)
             eval_camera = eval_cameras[eval_index]

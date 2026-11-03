@@ -857,7 +857,7 @@ def train_tfrf(
     eval_every = int(config.get("eval_every", 60))
     training_progress_every = max(
         1,
-        int(config.get("training_progress_every", config.get("progress_every", 1))),
+        int(config.get("training_progress_every", config.get("progress_every", 10))),
     )
     sample_count = int(config.get("samples", 32))
     scene_points = (

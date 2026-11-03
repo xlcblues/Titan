@@ -466,21 +466,26 @@ def _camera_rays_from_pose(
 
 def _scene_transform(
     cameras: list[dict],
+    scene_points: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, float]:
     positions = np.asarray(
         [np.asarray(camera["c2w"], dtype=np.float32)[:3, 3] for camera in cameras]
     )
-    if len(positions) == 0:
+    anchors = positions
+    if scene_points is not None and len(scene_points):
+        points = np.asarray(scene_points, dtype=np.float32).reshape(-1, 3)
+        if len(points):
+            anchors = np.concatenate([positions, points], axis=0)
+    if len(anchors) == 0:
         return (
             torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
             1.0,
         )
-    shift = np.median(positions, axis=0)
-    radius = float(np.median(np.linalg.norm(positions - shift, axis=1)))
+    shift = np.median(anchors, axis=0)
+    radius = float(np.median(np.linalg.norm(anchors - shift, axis=1)))
     if not np.isfinite(radius) or radius <= 1e-6:
         radius = 1.0
-    scale = 1.0 / radius
-    return torch.tensor(shift, dtype=torch.float32), scale
+    return torch.tensor(shift, dtype=torch.float32), radius
 
 
 def _ray_bounds(
@@ -523,13 +528,17 @@ def train_tcf(
         log("[tcf] 使用 CPU 训练（未检测到 CUDA）")
 
     model = TitanCoherenceField(config).to(device)
-    shift, radius = _scene_transform(cameras)
-    shift = shift.to(device)
-    scale = 1.0 / max(float(radius), 1e-6)
     scene_points = (
         np.asarray(sparse_points, dtype=np.float32)[:, :3]
         if sparse_points is not None and len(sparse_points)
         else np.empty((0, 3), dtype=np.float32)
+    )
+    shift, radius = _scene_transform(cameras, scene_points)
+    shift = shift.to(device)
+    scale = 1.0 / max(float(radius), 1e-6)
+    log(
+        f"[tcf] 场景归一化 shift {shift.cpu().numpy().tolist()} "
+        f"radius {radius:.4f} scale {scale:.6f}"
     )
 
     train_count = max(1, int(config.get("train_views", 16)))

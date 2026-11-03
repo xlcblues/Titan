@@ -171,6 +171,61 @@ function buildMesh(): THREE.Group {
   return group;
 }
 
+function buildTitanLattice(
+  pointBox: THREE.Box3,
+  sceneRadius: number,
+  fallbackCenter: THREE.Vector3,
+): THREE.Group {
+  const group = new THREE.Group();
+  const box = pointBox.isEmpty()
+    ? new THREE.Box3().setFromCenterAndSize(
+        fallbackCenter,
+        new THREE.Vector3(sceneRadius * 2, sceneRadius * 2, sceneRadius * 2),
+      )
+    : pointBox.clone();
+  const size = box.getSize(new THREE.Vector3());
+  box.expandByScalar(
+    Math.max(Math.max(size.x, size.y, size.z) * 0.04, 1e-3),
+  );
+
+  const min = box.min;
+  const max = box.max;
+  const divisions = 8;
+  const positions: number[] = [];
+  for (let i = 0; i <= divisions; i += 1) {
+    const t = i / divisions;
+    for (let j = 0; j <= divisions; j += 1) {
+      const s = j / divisions;
+      const y = min.y + (max.y - min.y) * t;
+      const z = min.z + (max.z - min.z) * s;
+      positions.push(min.x, y, z, max.x, y, z);
+
+      const x = min.x + (max.x - min.x) * t;
+      positions.push(x, min.y, z, x, max.y, z);
+
+      const xx = min.x + (max.x - min.x) * s;
+      const yy = min.y + (max.y - min.y) * t;
+      positions.push(xx, yy, min.z, xx, yy, max.z);
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(positions, 3),
+  );
+  const lines = new THREE.LineSegments(
+    geometry,
+    new THREE.LineBasicMaterial({
+      color: ACCENT,
+      transparent: true,
+      opacity: 0.16,
+    }),
+  );
+  group.add(lines);
+  return group;
+}
+
 function buildCameraPath(
   frames: number,
   radius: number,
@@ -606,7 +661,7 @@ export function createDemoScene(): SceneBundle {
   return demo;
 }
 
-function normalizeViewerY(scene: TitanSceneData): TitanSceneData {
+export function normalizeViewerY(scene: TitanSceneData): TitanSceneData {
   const flipY = scene.poseSource === "colmap" || scene.poseSource === "llff";
   if (!flipY) return scene;
   const flip = (values: number[]) => [values[0], -values[1], values[2]];
@@ -700,15 +755,25 @@ export function createTitanScene(data: TitanSceneData): SceneBundle {
   }
 
   const points = buildTitanPoints(pointEntries, Math.max(pointRadius, 1e-3));
-  const mesh = new THREE.Group();
+  const mesh = buildTitanLattice(pointBox, sceneRadius, combinedCenter);
   const {
     path: cameraPath,
     curve,
     scanner,
     markers,
   } = buildTitanCameraPath(cameraEntries, cameraRadius);
-  const ground = buildGround(sceneRadius);
-  ground.position.y = combinedCenter.y - sceneRadius;
+  const groundRadius = pointBox.isEmpty()
+    ? sceneRadius
+    : Math.max(pointRadius, 1e-3);
+  const groundCenter = pointBox.isEmpty()
+    ? combinedCenter.clone()
+    : pointBox.getCenter(new THREE.Vector3());
+  const ground = buildGround(groundRadius);
+  ground.position.set(
+    groundCenter.x,
+    groundCenter.y - groundRadius,
+    groundCenter.z,
+  );
   const selection = new THREE.Mesh(
     new THREE.SphereGeometry(0.17, 18, 18),
     new THREE.MeshBasicMaterial({

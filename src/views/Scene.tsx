@@ -36,11 +36,10 @@ const MODES: {
   value: SceneMode;
   label: string;
   icon: LucideIcon;
-  realScene?: boolean;
 }[] = [
   { value: "camera", label: "相机路径", icon: Camera },
   { value: "points", label: "点云", icon: Grid3x3 },
-  { value: "mesh", label: "网格", icon: Boxes, realScene: false },
+  { value: "mesh", label: "网格", icon: Boxes },
 ];
 
 function formatMetric(
@@ -105,10 +104,6 @@ export function Scene() {
       mounted = false;
     };
   }, [projectId]);
-
-  useEffect(() => {
-    if (scene && mode === "mesh") setMode("points");
-  }, [scene, mode]);
 
   useEffect(() => {
     setRenderPage(0);
@@ -229,14 +224,13 @@ export function Scene() {
             <ArrowLeft size={16} />
           </Link>
           <div className="segmented" role="group" aria-label="场景显示模式">
-            {MODES.map(({ value, label, icon: Icon, realScene }) => (
+            {MODES.map(({ value, label, icon: Icon }) => (
               <button
                 key={value}
                 type="button"
                 aria-pressed={mode === value}
                 onClick={() => setMode(value)}
-                title={realScene === false && scene ? "网格模式暂未开放" : label}
-                disabled={realScene === false && Boolean(scene)}
+                title={label}
               >
                 <Icon size={16} />
                 <span>{label}</span>

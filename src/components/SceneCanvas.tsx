@@ -6,9 +6,11 @@ import {
 } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   createDemoScene,
   createTitanScene,
+  normalizeViewerY,
   type SceneBundle,
   type SceneMode,
   type TitanSceneData,
@@ -33,9 +35,123 @@ interface SceneCanvasProps {
 
 function disposeMaterial(material: THREE.Material | THREE.Material[]) {
   if (Array.isArray(material)) {
-    material.forEach((item) => item.dispose());
+    material.forEach((item) => {
+      item.dispose();
+      (item as THREE.MeshBasicMaterial).map?.dispose();
+    });
   } else {
     material.dispose();
+    (material as THREE.MeshBasicMaterial).map?.dispose();
+  }
+}
+
+function renderCameraIndex(
+  render: { name: string; view: string },
+  trainCount: number,
+  cameraCount: number,
+): number | null {
+  const match = /^render_(train|eval)_(\d{3})\.png$/.exec(render.name);
+  if (!match) return null;
+  const index = Number(match[2]);
+  if (match[1] === "train") return index;
+  if (trainCount < cameraCount) return trainCount + index;
+  return cameraCount - 1;
+}
+
+async function attachRenderViews(
+  bundle: SceneBundle,
+  scene: TitanSceneData,
+  isActive: () => boolean,
+): Promise<void> {
+  const projectBase = (scene.projectDir ?? "").replace(/\\/g, "/");
+  const viewerData = normalizeViewerY(scene);
+  const trainCount = Math.max(
+    1,
+    typeof scene.config?.train_views === "number"
+      ? scene.config.train_views
+      : 1,
+  );
+  const loader = new THREE.TextureLoader();
+  const views = new THREE.Group();
+
+  for (const render of scene.renders ?? []) {
+    const cameraIndex = renderCameraIndex(
+      render,
+      trainCount,
+      scene.cameras.length,
+    );
+    const camera =
+      cameraIndex === null ? undefined : viewerData.cameras[cameraIndex];
+    if (!camera) continue;
+
+    try {
+      const texture = await loader.loadAsync(
+        convertFileSrc(`${projectBase}/${render.path}`),
+      );
+      if (!isActive()) {
+        texture.dispose();
+        return;
+      }
+      texture.colorSpace = THREE.SRGBColorSpace;
+
+      const width = camera.width ?? 192;
+      const height = camera.height ?? 192;
+      const planeWidth = Math.max(
+        bundle.sceneRadius * 0.28 * (width / 512),
+        0.3,
+      );
+      const planeHeight = planeWidth * (height / width);
+      const plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(planeWidth, planeHeight),
+        new THREE.MeshBasicMaterial({
+          map: texture,
+          transparent: true,
+          opacity: 0.96,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        }),
+      );
+      plane.position.set(
+        camera.position[0],
+        camera.position[1],
+        camera.position[2],
+      );
+
+      const forward = new THREE.Vector3(
+        camera.forward[0],
+        camera.forward[1],
+        camera.forward[2],
+      ).normalize();
+      const worldUp = new THREE.Vector3(0, 1, 0);
+      const right = new THREE.Vector3().crossVectors(worldUp, forward);
+      if (right.lengthSq() < 1e-6) {
+        right.set(1, 0, 0);
+      }
+      right.normalize();
+      const cameraUp = new THREE.Vector3().crossVectors(
+        forward,
+        right,
+      ).normalize();
+      plane.quaternion.setFromRotationMatrix(
+        new THREE.Matrix4().makeBasis(right, cameraUp, forward),
+      );
+      views.add(plane);
+    } catch {
+      // 单个渲染图加载失败时不阻塞场景显示。
+    }
+  }
+
+  if (isActive()) {
+    bundle.mesh.add(views);
+  } else {
+    views.traverse((object) => {
+      if (object instanceof THREE.Mesh) {
+        object.geometry.dispose();
+        const material = object.material as THREE.MeshBasicMaterial;
+        material.dispose();
+        material.map?.dispose();
+      }
+    });
   }
 }
 
@@ -120,6 +236,9 @@ export const SceneCanvas = forwardRef<
     bundle.setMode(modeRef.current);
     world.add(bundle.group);
     demoRef.current = bundle;
+    if (scene?.renders?.length && scene.projectDir) {
+      void attachRenderViews(bundle, scene, () => demoRef.current === bundle);
+    }
     const radius = Math.max(bundle.sceneRadius, 1e-3);
     const fitBundle = (bundleToFit: SceneBundle, fitMode: SceneMode) => {
       const focusCenter =

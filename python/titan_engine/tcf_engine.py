@@ -550,13 +550,13 @@ def train_tcf(
         eval_cameras = cameras[-1:]
 
     steps = max(1, int(config.get("steps", 1200)))
+    half_step = max(0, steps // 2)
     patch = max(64, int(config.get("patch_size", 1024)))
     coarse_samples = int(config.get("coarse_samples", 32))
     fine_samples = int(config.get("fine_samples", 16))
     ray_batch = int(config.get("ray_batch_size", 4096))
     readout_chunk = int(config.get("readout_chunk", 131072))
     progress_every = max(1, int(config.get("training_progress_every", 10)))
-    eval_every = max(1, int(config.get("eval_every", 100)))
     learning_rate = float(config.get("learning_rate", 0.01))
     lr_end = float(config.get("learning_rate_end", 0.002))
     use_amp = bool(config.get("mixed_precision", True))
@@ -700,8 +700,8 @@ def train_tcf(
             if status_cb:
                 status_cb(payload)
 
-        if step % eval_every == 0 or step == steps - 1:
-            eval_index = (step // eval_every) % len(eval_cameras)
+        if step == half_step or step == steps - 1:
+            eval_index = 0 if step == half_step else len(eval_cameras) - 1
             eval_camera = eval_cameras[eval_index]
             target_index = len(cameras) - len(eval_cameras) + eval_index
             if target_index < len(images):

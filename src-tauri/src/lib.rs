@@ -857,7 +857,6 @@ fn start_reconstruction(
         "steps": 1200,
         "train_views": 16,
         "patch_size": 1024,
-        "eval_every": 100,
         "training_progress_every": 10,
         "learning_rate": 0.01,
         "learning_rate_end": 0.002,

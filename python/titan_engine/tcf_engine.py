@@ -10,6 +10,7 @@ carried to that point.
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Callable
@@ -59,7 +60,7 @@ class CoherentLattice(nn.Module):
         scale: float = 1.6,
         max_resolution: int = 512,
         entries_per_level: int = 131072,
-        feature_dim: int = 4,
+        feature_dim: int = 8,
         seed: int = 11,
     ) -> None:
         super().__init__()
@@ -96,18 +97,24 @@ class CoherenceReadout(nn.Module):
 
     def __init__(
         self,
-        feature_dim: int = 4,
+        feature_dim: int = 8,
         levels: int = 8,
         position_levels: int = 4,
         direction_levels: int = 2,
-        hidden: int = 64,
+        hidden: int = 96,
         seed: int = 12,
+        context_scale: float = 8.0,
+        coherence_bias: float = 0.0,
+        capture_bias: float = 0.5,
     ) -> None:
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.levels = int(levels)
         self.position_levels = int(position_levels)
         self.direction_levels = int(direction_levels)
+        self.context_scale = float(context_scale)
+        self.coherence_bias = float(coherence_bias)
+        self.capture_bias = float(capture_bias)
         position_in = 3 * (1 + 2 * self.position_levels)
         direction_in = 3 * (1 + 2 * self.direction_levels)
         in_dim = self.feature_dim * self.levels + position_in + direction_in
@@ -121,6 +128,9 @@ class CoherenceReadout(nn.Module):
         nn.init.zeros_(self.linear_in.bias)
         nn.init.zeros_(self.linear_hidden.bias)
         nn.init.zeros_(self.linear_out.bias)
+        with torch.no_grad():
+            self.linear_out.bias[3] = self.coherence_bias
+            self.linear_out.bias[4] = self.capture_bias
 
     def forward(
         self,
@@ -128,13 +138,15 @@ class CoherenceReadout(nn.Module):
         positions: torch.Tensor,
         directions: torch.Tensor,
     ) -> torch.Tensor:
-        pos = self._encode(positions, self.position_levels)
-        direction = self._encode(directions, self.direction_levels)
-        hidden = torch.relu(
-            self.linear_in(torch.cat([context, pos, direction], dim=-1))
-        )
-        hidden = torch.relu(self.linear_hidden(hidden))
-        return self.linear_out(hidden)
+        with torch.autocast(device_type="cuda", enabled=False):
+            context = context.float() * self.context_scale
+            pos = self._encode(positions.float(), self.position_levels)
+            direction = self._encode(directions.float(), self.direction_levels)
+            hidden = torch.relu(
+                self.linear_in(torch.cat([context, pos, direction], dim=-1))
+            )
+            hidden = torch.relu(self.linear_hidden(hidden))
+            return self.linear_out(hidden)
 
     @staticmethod
     def _encode(values: torch.Tensor, levels: int) -> torch.Tensor:
@@ -158,17 +170,128 @@ class TitanCoherenceField(nn.Module):
             scale=float(config.get("lattice_scale", 1.6)),
             max_resolution=int(config.get("lattice_max_resolution", 512)),
             entries_per_level=int(config.get("lattice_entries", 131072)),
-            feature_dim=int(config.get("lattice_feature_dim", 4)),
+            feature_dim=int(config.get("lattice_feature_dim", 8)),
         )
         self.readout = CoherenceReadout(
-            feature_dim=int(config.get("lattice_feature_dim", 4)),
+            feature_dim=int(config.get("lattice_feature_dim", 8)),
             levels=levels,
             position_levels=int(config.get("position_levels", 4)),
             direction_levels=int(config.get("direction_levels", 2)),
-            hidden=int(config.get("readout_hidden", 64)),
+            hidden=int(config.get("readout_hidden", 96)),
+            context_scale=float(config.get("lattice_context_scale", 0.5)),
+            coherence_bias=float(
+                config.get("coherence_bias", config.get("density_bias", 0.0))
+            ),
+            capture_bias=float(config.get("capture_bias", 0.0)),
         )
-        self.background = nn.Parameter(
-            torch.tensor([0.08, 0.09, 0.10], dtype=torch.float32)
+        self.voting_temperature_start = float(
+            config.get("voting_temperature_start", 0.5)
+        )
+        self.voting_temperature_end = float(
+            config.get("voting_temperature_end", 3.0)
+        )
+        self.anchor_blend_start = float(
+            config.get("anchor_blend_start", 1.0)
+        )
+        self.anchor_blend_end = float(config.get("anchor_blend_end", 0.5))
+        self.anchor_blend_fraction = float(
+            config.get("anchor_blend_fraction", 1.0)
+        )
+        anchor_peak = float(config.get("anchor_peak", 6.0))
+        self.logit_floor = float(config.get("logit_floor", -3.0))
+        self.logit_floor_slope = float(
+            config.get("logit_floor_slope", 0.1)
+        )
+        self.consensus_temperature_start = float(
+            config.get("consensus_temperature_start", 1.5)
+        )
+        self.consensus_temperature_end = float(
+            config.get("consensus_temperature_end", 0.6)
+        )
+        self.consensus_near_bias = float(
+            config.get("consensus_near_bias", 0.5)
+        )
+        self.consensus_background_logit = float(
+            config.get("consensus_background_logit", 0.0)
+        )
+        self.consensus_top_k = int(config.get("consensus_top_k", 2))
+        self.coarse_samples = int(config.get("coarse_samples", 32))
+        self.fine_samples = int(config.get("fine_samples", 16))
+        self.consensus_sharp_start = float(
+            config.get("consensus_sharp_start", 0.0)
+        )
+        self.consensus_sharp_end = float(
+            config.get("consensus_sharp_end", 1.0)
+        )
+        self.register_buffer(
+            "background", torch.tensor([0.08, 0.09, 0.10], dtype=torch.float32)
+        )
+        self.register_buffer(
+            "coherence_temperature",
+            torch.tensor(self.voting_temperature_end, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "anchor_blend",
+            torch.tensor(self.anchor_blend_end, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "anchor_peak",
+            torch.tensor(anchor_peak, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "alpha_scale",
+            torch.tensor(float(config.get("alpha_scale", 6.0)), dtype=torch.float32),
+        )
+        self.capture_floor_start = float(config.get("capture_floor_start", 1.2))
+        self.capture_floor_end = float(config.get("capture_floor_end", 0.06))
+        self.register_buffer(
+            "capture_floor",
+            torch.tensor(self.capture_floor_end, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "consensus_temperature",
+            torch.tensor(
+                self.consensus_temperature_end, dtype=torch.float32
+            ),
+        )
+        self.register_buffer(
+            "consensus_sharp",
+            torch.tensor(self.consensus_sharp_end, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "logit_clamp",
+            torch.tensor(float(config.get("logit_clamp", 10.0)), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "background_target",
+            torch.tensor(
+                [float(v) for v in config.get("background_target", [0.08, 0.09, 0.10])],
+                dtype=torch.float32,
+            ),
+        )
+        self.peak_render_start = float(config.get("peak_render_start", 1.0))
+        self.peak_render_end = float(config.get("peak_render_end", 3.0))
+        self.register_buffer(
+            "peak_power",
+            torch.tensor(self.peak_render_end, dtype=torch.float32),
+        )
+        self.fine_anchor_fraction = float(
+            config.get("fine_anchor_fraction", 0.4)
+        )
+        self.peak_render_window = float(
+            config.get("peak_render_window", 2.2)
+        )
+        self.coarse_sampling_mode = str(
+            config.get("coarse_sampling_mode", "physical")
+        )
+        self.fine_sampling_mode = str(
+            config.get("fine_sampling_mode", "importance")
+        )
+        self.anchor_spread_fraction = float(
+            config.get("anchor_spread_fraction", 0.0)
+        )
+        self.consensus_include_coarse = bool(
+            config.get("consensus_include_coarse", False)
         )
 
     def lattice_mb(self) -> float:
@@ -274,14 +397,238 @@ class TitanCoherenceField(nn.Module):
         return torch.cat(outputs, dim=0)
 
 
+def _capture_logit(
+    coherence: torch.Tensor,
+    gates: torch.Tensor,
+    temperature: float | torch.Tensor = 1.0,
+    inverse_depth: torch.Tensor | None = None,
+    anchor_inverse: torch.Tensor | None = None,
+    anchor_spread: float | torch.Tensor | None = None,
+    anchor_blend: float | torch.Tensor = 0.0,
+    anchor_peak: float = 0.0,
+    anchor_mask: torch.Tensor | None = None,
+    logit_clamp: float = 10.0,
+    logit_floor: float = -3.0,
+    logit_floor_slope: float = 0.1,
+) -> torch.Tensor:
+    """Compute the capture score before it is turned into opacity.
+
+    The gate is a positive vote strength and the coherence field sharpens it
+    along the ray. A sparse point-cloud anchor raises the score around the
+    expected surface during early training. A leaky lower bound keeps gates
+    from drifting so far negative that opacity and its gradients collapse.
+    """
+    coherence = coherence.float()
+    gates = gates.float()
+    temperature = temperature.float()
+    capture_logit = gates + 0.5 * temperature * torch.tanh(coherence)
+    if inverse_depth is not None and anchor_inverse is not None:
+        anchor_inverse = anchor_inverse.to(capture_logit.dtype)
+        if anchor_inverse.dim() == 2 and anchor_inverse.shape[-1] != 1:
+            anchor_inverse = anchor_inverse[:, :1]
+        while anchor_inverse.dim() > 1 and anchor_inverse.shape[-1] == 1:
+            anchor_inverse = anchor_inverse.squeeze(-1)
+        if anchor_inverse.dim() == 1:
+            anchor_inverse = anchor_inverse.reshape(-1, 1, 1)
+        if anchor_spread is None:
+            anchor_spread = 0.15
+        if isinstance(anchor_spread, (int, float)):
+            spread = torch.as_tensor(
+                anchor_spread,
+                device=capture_logit.device,
+                dtype=capture_logit.dtype,
+            )
+        else:
+            spread = anchor_spread.to(capture_logit.dtype)
+            if spread.dim() == 2 and spread.shape[-1] != 1:
+                spread = spread[:, :1]
+            while spread.dim() > 1 and spread.shape[-1] == 1:
+                spread = spread.squeeze(-1)
+            if spread.dim() == 1:
+                spread = spread.reshape(-1, 1, 1)
+        anchor_score = -(
+            (inverse_depth.unsqueeze(-1) - anchor_inverse) ** 2
+            / (2.0 * spread**2 + 1e-6)
+        )
+        if isinstance(anchor_blend, (int, float)):
+            blend = torch.full_like(
+                anchor_inverse,
+                float(anchor_blend),
+                dtype=capture_logit.dtype,
+            )
+        else:
+            blend = anchor_blend.to(capture_logit.dtype).reshape(-1, 1, 1)
+        if anchor_mask is not None:
+            mask = (anchor_mask > 0).to(capture_logit.dtype).reshape(-1, 1, 1)
+            blend = blend * mask
+        capture_logit = capture_logit + blend * (
+            float(anchor_peak) + anchor_score
+        )
+    capture_logit = capture_logit.clamp(
+        min=-float(logit_clamp), max=float(logit_clamp)
+    )
+    floor = float(logit_floor)
+    if floor > -float(logit_clamp):
+        below = torch.relu(
+            torch.full_like(capture_logit, floor) - capture_logit
+        )
+        capture_logit = torch.clamp(capture_logit, min=floor) - (
+            float(logit_floor_slope) * below
+        )
+    return capture_logit
+
+
+def _consensus_weights(
+    capture_logit: torch.Tensor,
+    inverse_depth: torch.Tensor | None,
+    temperature: float = 1.0,
+    near_bias: float = 0.0,
+    background_logit: float = 0.0,
+    top_k: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Turn capture scores into a small set of coherent votes per ray.
+
+    Every sample along a ray competes for one consensus vote, and a fixed
+    background slot absorbs rays with no confident surface. Keeping only the
+    top-k sample votes and renormalizing them prevents many small opacity
+    layers from averaging colors into fog. This is what makes late training
+    converge on a surface instead of oscillating between diffuse shells.
+    """
+    temperature = max(float(temperature), 1e-3)
+    scores = capture_logit[..., 0] / temperature
+    if float(near_bias) > 0.0 and inverse_depth is not None:
+        inv = inverse_depth.float()
+        inv_min = inv.min(dim=1, keepdim=True).values
+        inv_max = inv.max(dim=1, keepdim=True).values
+        near_norm = (inv - inv_min) / (inv_max - inv_min + 1e-6)
+        scores = scores + float(near_bias) * near_norm
+    bg = torch.full_like(
+        scores[:, :1],
+        float(background_logit) / temperature,
+    )
+    all_scores = torch.cat([scores, bg], dim=1)
+    probs = torch.softmax(all_scores, dim=1)
+    sample_weights = probs[:, :-1].unsqueeze(-1)
+    bg_weight = probs[:, -1:].unsqueeze(-1)
+    top_k = max(0, int(top_k))
+    if top_k > 0 and sample_weights.shape[1] > top_k:
+        flat = sample_weights[..., 0]
+        top_values, top_indices = torch.topk(flat, top_k, dim=1)
+        selected = torch.zeros_like(flat)
+        selected.scatter_(1, top_indices, top_values)
+        sample_weights = (
+            selected / selected.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        ).unsqueeze(-1)
+    return sample_weights, bg_weight
+
+
 def _voting_weights(
     coherence: torch.Tensor,
     gates: torch.Tensor,
+    temperature: float | torch.Tensor = 1.0,
+    inverse_depth: torch.Tensor | None = None,
+    anchor_inverse: torch.Tensor | None = None,
+    anchor_spread: float | torch.Tensor | None = None,
+    anchor_blend: float | torch.Tensor = 0.0,
+    anchor_peak: float = 0.0,
+    anchor_mask: torch.Tensor | None = None,
+    segment_lengths: torch.Tensor | None = None,
+    alpha_scale: float = 1.0,
+    capture_floor: float = 0.0,
+    logit_clamp: float = 10.0,
+    logit_floor: float = -3.0,
+    logit_floor_slope: float = 0.1,
+    return_alpha: bool = False,
 ) -> torch.Tensor:
-    """Compute ray sample vote weights from coherence and carry gates."""
-    carry = torch.cumsum(gates, dim=1) - gates
-    votes = torch.softmax(coherence - carry, dim=1)
-    return votes
+    """Compute alpha-composited sample weights.
+
+    Opacity is the physical absorption of a ray segment:
+    ``alpha = 1 - exp(-strength * length * alpha_scale)``. Weights are the
+    volume-rendering product of opacity and accumulated transmittance. The
+    final color chain uses :func:`_consensus_weights` instead, so these
+    weights primarily drive geometry, visibility and point extraction.
+    """
+    capture_logit = _capture_logit(
+        coherence,
+        gates,
+        temperature,
+        inverse_depth=inverse_depth,
+        anchor_inverse=anchor_inverse,
+        anchor_spread=anchor_spread,
+        anchor_blend=anchor_blend,
+        anchor_peak=anchor_peak,
+        anchor_mask=anchor_mask,
+        logit_clamp=logit_clamp,
+        logit_floor=logit_floor,
+        logit_floor_slope=logit_floor_slope,
+    )
+    strength = torch.nn.functional.softplus(capture_logit)
+    if float(capture_floor) > 0.0:
+        strength = strength + float(capture_floor)
+
+    if segment_lengths is None:
+        if inverse_depth is not None:
+            inv = inverse_depth.float()
+            segment_lengths = torch.abs(
+                inv[:, 1:] - inv[:, :-1]
+            ) / inv[:, :-1].clamp(min=1e-6).square()
+            segment_lengths = torch.cat(
+                [segment_lengths, segment_lengths[:, -1:]], dim=1
+            )
+        else:
+            segment_lengths = torch.ones_like(strength)
+    segment_lengths = segment_lengths.to(strength.dtype)
+    if segment_lengths.dim() == strength.dim() - 1:
+        segment_lengths = segment_lengths.unsqueeze(-1)
+    exponent = (strength * segment_lengths * float(alpha_scale)).clamp(
+        max=30.0
+    )
+    alpha = 1.0 - torch.exp(-exponent)
+    transmittance = torch.cumprod(1.0 - alpha, dim=1)
+    transmittance = torch.cat(
+        [torch.ones_like(transmittance[:, :1]), transmittance[:, :-1]],
+        dim=1,
+    )
+    weights = alpha * transmittance
+    if return_alpha:
+        return weights, alpha
+    return weights
+
+
+def _peak_render_weights(
+    weights: torch.Tensor,
+    peak_power: float,
+    inverse_depth: torch.Tensor | None = None,
+    window_width: float = 2.2,
+) -> torch.Tensor:
+    """Sharpen the final color vote around the dominant sample.
+
+    The sharpened vote is additionally windowed around the current peak in
+    inverse-depth space. The peak index is detached, so the optimizer only
+    has to move the sample votes that are already near the winner; it never
+    has to differentiate through a discrete winner switch.
+    """
+    if float(peak_power) <= 1.0:
+        return weights
+    peak_scale = weights.max(dim=1, keepdim=True).values.clamp(min=1e-6)
+    surface = (weights / peak_scale).clamp(min=0.0) ** float(peak_power)
+    if inverse_depth is not None:
+        peak_index = weights.max(dim=1).indices
+        peak_inverse = inverse_depth.gather(1, peak_index)
+        if inverse_depth.shape[1] > 1:
+            spacing = (inverse_depth[:, 1:] - inverse_depth[:, :-1]).abs()
+            median_spacing = torch.median(spacing, dim=1, keepdim=True).values
+            bandwidth = median_spacing * float(window_width)
+        else:
+            bandwidth = torch.ones_like(inverse_depth[:, :1]) * 1e-3
+        distance = (inverse_depth - peak_inverse).abs()
+        window = torch.exp(
+            -0.5
+            * (distance / bandwidth.clamp(min=1e-4)) ** 2
+            * float(peak_power)
+        )
+        surface = surface * window.unsqueeze(-1)
+    return surface / surface.sum(dim=1, keepdim=True).clamp(min=1e-6)
 
 
 def _sample_rays(
@@ -291,13 +638,16 @@ def _sample_rays(
     far: float,
     samples: int,
     fine_inverse: torch.Tensor | None = None,
+    fine_spread: float | None = None,
+    jitter: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inverse_near = 1.0 / max(float(near), 1e-4)
     inverse_far = 1.0 / max(float(far), 1e-3)
     if fine_inverse is None:
+        spacing = (inverse_far - inverse_near) / float(samples)
         inverse_depth = torch.linspace(
-            inverse_far,
             inverse_near,
+            inverse_far,
             samples,
             device=origins.device,
             dtype=origins.dtype,
@@ -305,11 +655,25 @@ def _sample_rays(
         inverse_depth = inverse_depth.unsqueeze(0).expand(
             origins.shape[0], samples
         )
+        if jitter:
+            inverse_depth = inverse_depth + (
+                torch.rand(
+                    origins.shape[0],
+                    samples,
+                    device=origins.device,
+                    dtype=origins.dtype,
+                )
+                - 0.5
+            ) * spacing
     else:
-        spread = max((inverse_far - inverse_near) * 0.5, 1e-3)
+        spread = (
+            fine_spread
+            if fine_spread is not None
+            else max((inverse_far - inverse_near) * 0.5, 1e-3)
+        )
         offsets = torch.linspace(
-            -1.0,
             1.0,
+            -1.0,
             samples,
             device=origins.device,
             dtype=origins.dtype,
@@ -326,6 +690,257 @@ def _sample_rays(
     return positions, inverse_depth
 
 
+def _segment_lengths(
+    positions: torch.Tensor,
+    inverse_depths: torch.Tensor,
+) -> torch.Tensor:
+    """Physical path length between samples along each ray.
+
+    Samples are parameterized by inverse depth, so the difference in
+    inverse-depth values is not a distance. The actual segment length is the
+    Euclidean distance between neighboring sample positions.
+    """
+    segment = torch.linalg.norm(
+        positions[:, 1:] - positions[:, :-1],
+        dim=-1,
+    )
+    last = segment[:, -1:]
+    return torch.cat([segment, last], dim=1)
+
+
+def _importance_sample_rays(
+    origins: torch.Tensor,
+    directions: torch.Tensor,
+    samples: int,
+    coarse_weights: torch.Tensor,
+    coarse_inverse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Importance-sample fine points from the coarse coherence votes."""
+    weights = coarse_weights[..., 0].clamp(min=0.0)
+    cdf = torch.cumsum(weights, dim=1)
+    total = cdf[:, -1:].clamp(min=1e-6)
+    cdf = cdf / total
+    bins = (
+        torch.arange(samples, device=origins.device, dtype=origins.dtype)
+        .unsqueeze(0)
+        .expand(origins.shape[0], samples)
+    )
+    u = bins + torch.rand(
+        origins.shape[0], samples, device=origins.device, dtype=origins.dtype
+    )
+    u = (u / samples).clamp(0.0, 1.0 - 1e-6)
+    indices = torch.searchsorted(cdf, u)
+    hi = indices.clamp(1, coarse_inverse.shape[1] - 1)
+    lo = hi - 1
+    cdf_lo = cdf.gather(1, lo)
+    cdf_hi = cdf.gather(1, hi)
+    fraction = ((u - cdf_lo) / (cdf_hi - cdf_lo).clamp(min=1e-6)).clamp(0.0, 1.0)
+    inverse_depth = (
+        coarse_inverse.gather(1, lo) * (1.0 - fraction)
+        + coarse_inverse.gather(1, hi) * fraction
+    )
+    degenerate = (total < 1e-4).squeeze(-1)
+    if bool(degenerate.any()):
+        uniform = torch.linspace(
+            float(coarse_inverse[0, 0]),
+            float(coarse_inverse[0, -1]),
+            samples,
+            device=origins.device,
+            dtype=origins.dtype,
+        ).unsqueeze(0).expand(origins.shape[0], samples)
+        inverse_depth = torch.where(
+            degenerate.unsqueeze(1).expand_as(inverse_depth),
+            uniform,
+            inverse_depth,
+        )
+    positions = (
+        origins.unsqueeze(1)
+        + directions.unsqueeze(1) / inverse_depth.unsqueeze(-1)
+    )
+    return positions, inverse_depth
+
+
+def _coherence_peak_sample_rays(
+    origins: torch.Tensor,
+    directions: torch.Tensor,
+    samples: int,
+    coarse_weights: torch.Tensor,
+    coarse_inverse: torch.Tensor,
+    near: float,
+    far: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample a tight band around the strongest coarse coherence vote.
+
+    The coarse pass can still be broad, so this keeps fine samples focused
+    on the current peak instead of splitting them across every secondary
+    shell. The band width adapts to the local inverse-depth spacing so an
+    early diffuse vote still spans enough space to be corrected.
+    """
+    weights = coarse_weights[..., 0].clamp(min=0.0)
+    peak_index = weights.argmax(dim=1, keepdim=True)
+    peak_inverse = coarse_inverse.gather(1, peak_index)
+    degenerate = weights.max(dim=1).values < 1e-3
+    if coarse_inverse.shape[1] > 1:
+        spacing = (coarse_inverse[:, 1:] - coarse_inverse[:, :-1]).abs()
+        median_spacing = torch.median(spacing, dim=1, keepdim=True).values
+        local_index = peak_index.clamp(max=coarse_inverse.shape[1] - 2)
+        local_spacing = spacing.gather(1, local_index).clamp(
+            min=median_spacing * 0.5
+        )
+        spread = torch.maximum(local_spacing, median_spacing * 0.75)
+    else:
+        spread = torch.ones_like(peak_inverse) * 1e-3
+    inverse_near = 1.0 / max(float(near), 1e-4)
+    inverse_far = 1.0 / max(float(far), 1e-3)
+    offsets = torch.linspace(
+        1.0,
+        -1.0,
+        samples,
+        device=origins.device,
+        dtype=origins.dtype,
+    )
+    inverse_depth = peak_inverse + offsets[None, :] * (spread * 1.25)
+    inverse_depth = torch.clamp(
+        inverse_depth,
+        min=inverse_far * 0.98,
+        max=inverse_near * 1.02,
+    )
+    if bool(degenerate.any()):
+        uniform = torch.linspace(
+            inverse_near,
+            inverse_far,
+            samples,
+            device=origins.device,
+            dtype=origins.dtype,
+        ).unsqueeze(0).expand(origins.shape[0], samples)
+        inverse_depth = torch.where(
+            degenerate.unsqueeze(1).expand_as(inverse_depth),
+            uniform,
+            inverse_depth,
+        )
+    positions = (
+        origins.unsqueeze(1)
+        + directions.unsqueeze(1) / inverse_depth.unsqueeze(-1)
+    )
+    return positions, inverse_depth
+
+
+def _anchor_sample_rays(
+    origins: torch.Tensor,
+    directions: torch.Tensor,
+    near: float,
+    far: float,
+    samples: int,
+    anchor_inverse: torch.Tensor,
+    spread: float | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample a tight band around a per-ray inverse-depth anchor.
+
+    Sparse point evidence gives an approximate surface depth for many rays.
+    Placing a subset of fine samples directly around that anchor guarantees
+    the readout can build a sharp vote at the target instead of having to
+    rediscover the surface from a broad coarse distribution.
+    """
+    inverse_near = 1.0 / max(float(near), 1e-4)
+    inverse_far = 1.0 / max(float(far), 1e-3)
+    offsets = torch.linspace(
+        1.0,
+        -1.0,
+        samples,
+        device=origins.device,
+        dtype=origins.dtype,
+    )
+    if isinstance(spread, torch.Tensor):
+        inverse_depth = (
+            anchor_inverse.unsqueeze(1)
+            + offsets[None, :] * spread.unsqueeze(1)
+        )
+    else:
+        inverse_depth = anchor_inverse.unsqueeze(1) + offsets[None, :] * spread
+    inverse_depth = torch.clamp(
+        inverse_depth,
+        min=inverse_far * 0.98,
+        max=inverse_near * 1.02,
+    )
+    positions = (
+        origins.unsqueeze(1)
+        + directions.unsqueeze(1) / inverse_depth.unsqueeze(-1)
+    )
+    return positions, inverse_depth
+
+
+def _fine_sample_rays(
+    origins: torch.Tensor,
+    directions: torch.Tensor,
+    near: float,
+    far: float,
+    samples: int,
+    coarse_weights: torch.Tensor,
+    coarse_inverse: torch.Tensor,
+    anchor_inverse: torch.Tensor | None = None,
+    anchor_spread: torch.Tensor | float | None = None,
+    anchor_fraction: float = 0.4,
+    sampling_mode: str = "importance",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Importance-sample fine points, optionally around point-cloud anchors.
+
+    The fine chain follows the coarse vote distribution instead of being
+    locked to a single coarse peak, so a wrong early peak can still be
+    corrected later. A minority of samples stay around sparse point depth
+    when anchors are available, which keeps the surface from drifting off
+    the evidence.
+    """
+    samples = max(1, int(samples))
+    anchor_samples = 0
+    if anchor_inverse is not None and samples > 1:
+        anchor_samples = max(
+            1,
+            min(
+                samples - 1,
+                int(round(samples * float(anchor_fraction))),
+            ),
+        )
+    importance_samples = samples - anchor_samples
+    if sampling_mode == "peak":
+        fine_importance, fine_importance_inv = _coherence_peak_sample_rays(
+            origins,
+            directions,
+            importance_samples,
+            coarse_weights,
+            coarse_inverse,
+            near,
+            far,
+        )
+    else:
+        fine_importance, fine_importance_inv = _importance_sample_rays(
+            origins,
+            directions,
+            importance_samples,
+            coarse_weights,
+            coarse_inverse,
+        )
+    if anchor_samples > 0:
+        fine_anchor, fine_anchor_inv = _anchor_sample_rays(
+            origins,
+            directions,
+            near,
+            far,
+            anchor_samples,
+            anchor_inverse,
+            anchor_spread,
+        )
+        fine_positions = torch.cat(
+            [fine_importance, fine_anchor], dim=1
+        )
+        fine_inverse = torch.cat(
+            [fine_importance_inv, fine_anchor_inv], dim=1
+        )
+    else:
+        fine_positions = fine_importance
+        fine_inverse = fine_importance_inv
+    return fine_positions, fine_inverse
+
+
 def render_rays_chunk(
     model: TitanCoherenceField,
     origins: torch.Tensor,
@@ -336,17 +951,42 @@ def render_rays_chunk(
     fine_samples: int = 16,
     readout_chunk: int = 131072,
     use_amp: bool = True,
-) -> torch.Tensor:
+    jitter: bool = False,
+    anchor_depth: torch.Tensor | None = None,
+    anchor_spread: float = 0.08,
+    anchor_spread_fraction: float | None = None,
+    anchor_mask: torch.Tensor | None = None,
+    return_detail: bool = False,
+) -> torch.Tensor | tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Render a batch of rays with coherence voting.
 
-    A coarse pass locates the coherent region, then a fine pass refines the
-    vote around it. Both passes share the same lattice and readout.
+    A coarse pass locates the coherent region and guides importance
+    sampling. The final color vote is computed only from the fine chain:
+    half of the fine samples follow the coarse importance distribution and
+    the other half are anchored around per-ray point-cloud depth when
+    available. Keeping the final chain thin prevents broad density shells
+    from averaging colors into fog.
     """
+    if anchor_spread_fraction is None:
+        anchor_spread_fraction = float(
+            getattr(model, "anchor_spread_fraction", 0.0)
+        )
     device = origins.device
     with torch.autocast("cuda", enabled=use_amp and device.type == "cuda"):
-        coarse_positions, inverse_depths = _sample_rays(
-            origins, directions, near, far, coarse_samples
+        coarse_positions, coarse_inverse = _sample_rays(
+            origins, directions, near, far, coarse_samples, jitter=jitter
         )
+        inverse_span = float(coarse_inverse[0, 0] - coarse_inverse[0, -1])
         coarse_logits = model.readout_logits(
             coarse_positions.reshape(-1, 3),
             directions.unsqueeze(1).expand_as(coarse_positions).reshape(-1, 3),
@@ -355,21 +995,108 @@ def render_rays_chunk(
         coarse_logits = coarse_logits.reshape(
             origins.shape[0], coarse_samples, 5
         )
-        coarse_color = torch.sigmoid(coarse_logits[..., 0:3])
-        coarse_coherence = coarse_logits[..., 3:4]
-        coarse_gates = torch.sigmoid(coarse_logits[..., 4:5])
-        coarse_weights = _voting_weights(coarse_coherence, coarse_gates)
-        expected_inverse = torch.sum(
-            coarse_weights * inverse_depths.unsqueeze(-1), dim=1
+        temperature = model.coherence_temperature.to(coarse_logits.dtype)
+        alpha_scale = float(model.alpha_scale)
+        coarse_segments = _segment_lengths(coarse_positions, coarse_inverse)
+        anchor_inverse = None
+        anchor_spread_t = None
+        anchor_mask_float = None
+        if anchor_depth is not None:
+            inverse_near = 1.0 / max(float(near), 1e-4)
+            inverse_far = 1.0 / max(float(far), 1e-3)
+            hit_spread = float(anchor_spread)
+            fallback_spread = max((inverse_far - inverse_near) * 0.25, 1e-3)
+            if float(anchor_spread_fraction) > 0.0:
+                max_spread = inverse_span * float(anchor_spread_fraction)
+                hit_spread = min(float(anchor_spread), max_spread)
+                fallback_spread = min(fallback_spread, max_spread)
+            hit_inverse = 1.0 / anchor_depth.clamp(min=1e-4)
+            fallback_inverse = coarse_inverse[:, coarse_samples // 2]
+            if anchor_mask is not None:
+                anchor_mask_float = (anchor_mask > 0).to(torch.float32)
+                mask = (
+                    (anchor_mask > 0).squeeze(-1)
+                    if anchor_mask.dim() > 1
+                    else (anchor_mask > 0)
+                )
+                hit_inverse_flat = (
+                    hit_inverse.squeeze(-1)
+                    if hit_inverse.dim() > 1
+                    else hit_inverse
+                )
+                anchor_inverse = torch.where(mask, hit_inverse_flat, fallback_inverse)
+                anchor_spread_t = torch.where(
+                    mask,
+                    torch.full_like(hit_inverse_flat, hit_spread),
+                    torch.full_like(fallback_inverse, fallback_spread),
+                )
+            else:
+                anchor_inverse = (
+                    hit_inverse.squeeze(-1)
+                    if hit_inverse.dim() > 1
+                    else hit_inverse
+                )
+                anchor_spread_t = torch.full_like(anchor_inverse, hit_spread)
+        coarse_weights = _voting_weights(
+            coarse_logits[..., 3:4],
+            coarse_logits[..., 4:5],
+            temperature,
+            inverse_depth=coarse_inverse,
+            anchor_inverse=anchor_inverse,
+            anchor_spread=anchor_spread_t,
+            anchor_blend=model.anchor_blend,
+            anchor_peak=model.anchor_peak,
+            anchor_mask=anchor_mask_float,
+            segment_lengths=coarse_segments,
+            alpha_scale=alpha_scale,
+            capture_floor=float(model.capture_floor),
+            logit_clamp=float(model.logit_clamp),
         )
 
-        fine_positions, _ = _sample_rays(
+        sampling_weights = coarse_weights
+        if model.coarse_sampling_mode == "consensus":
+            coarse_capture_logit = _capture_logit(
+                coarse_logits[..., 3:4],
+                coarse_logits[..., 4:5],
+                temperature,
+                inverse_depth=coarse_inverse,
+                anchor_inverse=anchor_inverse,
+                anchor_spread=anchor_spread_t,
+                anchor_blend=model.anchor_blend,
+                anchor_peak=model.anchor_peak,
+                anchor_mask=anchor_mask_float,
+                logit_clamp=float(model.logit_clamp),
+                logit_floor=float(model.logit_floor),
+                logit_floor_slope=float(model.logit_floor_slope),
+            )
+            sampling_weights, _ = _consensus_weights(
+                coarse_capture_logit,
+                coarse_inverse,
+                float(model.consensus_temperature),
+                near_bias=0.0,
+                background_logit=float(model.consensus_background_logit),
+                top_k=4,
+            )
+
+        if anchor_depth is not None:
+            if anchor_inverse is None:
+                anchor_inverse = 1.0 / anchor_depth.clamp(min=1e-4)
+            if anchor_spread_t is None:
+                anchor_spread_t = torch.full_like(
+                    anchor_inverse, anchor_spread
+                )
+        fine_positions, fine_inverse = _fine_sample_rays(
             origins,
             directions,
             near,
             far,
             fine_samples,
-            fine_inverse=expected_inverse,
+            sampling_weights,
+            coarse_inverse,
+            anchor_inverse=anchor_inverse,
+            anchor_spread=anchor_spread_t,
+            anchor_fraction=float(model.fine_anchor_fraction),
+            sampling_mode=str(model.fine_sampling_mode),
         )
         fine_logits = model.readout_logits(
             fine_positions.reshape(-1, 3),
@@ -377,16 +1104,98 @@ def render_rays_chunk(
             chunk=readout_chunk,
         )
         fine_logits = fine_logits.reshape(origins.shape[0], fine_samples, 5)
-        fine_color = torch.sigmoid(fine_logits[..., 0:3])
-        fine_coherence = fine_logits[..., 3:4]
-        fine_gates = torch.sigmoid(fine_logits[..., 4:5])
-        fine_weights = _voting_weights(fine_coherence, fine_gates)
 
-        color = torch.sum(fine_weights * fine_color, dim=1)
-        visibility = fine_weights.sum(dim=1).clamp(max=1.0)
-        residual = torch.clamp(1.0 - visibility, min=0.0)
+        order = torch.argsort(fine_inverse, dim=1, descending=True)
+        fine_inverse = torch.gather(fine_inverse, 1, order)
+        fine_positions = torch.gather(
+            fine_positions, 1, order.unsqueeze(-1).expand_as(fine_positions)
+        )
+        fine_logits = torch.gather(
+            fine_logits, 1, order.unsqueeze(-1).expand_as(fine_logits)
+        )
+
+        sample_colors = torch.sigmoid(fine_logits[..., 0:3])
+        fine_segments = _segment_lengths(fine_positions, fine_inverse)
+        weights, sample_alpha = _voting_weights(
+            fine_logits[..., 3:4],
+            fine_logits[..., 4:5],
+            temperature,
+            inverse_depth=fine_inverse,
+            anchor_inverse=anchor_inverse,
+            anchor_spread=anchor_spread_t,
+            anchor_blend=model.anchor_blend,
+            anchor_peak=model.anchor_peak,
+            anchor_mask=anchor_mask_float,
+            segment_lengths=fine_segments,
+            alpha_scale=alpha_scale,
+            capture_floor=float(model.capture_floor),
+            logit_clamp=float(model.logit_clamp),
+            return_alpha=True,
+        )
+        sample_gates = fine_logits[..., 4:5].float()
+        capture_logit = _capture_logit(
+            fine_logits[..., 3:4],
+            fine_logits[..., 4:5],
+            temperature,
+            inverse_depth=fine_inverse,
+            anchor_inverse=anchor_inverse,
+            anchor_spread=anchor_spread_t,
+            anchor_blend=model.anchor_blend,
+            anchor_peak=model.anchor_peak,
+            anchor_mask=anchor_mask_float,
+            logit_clamp=float(model.logit_clamp),
+            logit_floor=float(model.logit_floor),
+            logit_floor_slope=float(model.logit_floor_slope),
+        )
+        consensus_weights, bg_weight = _consensus_weights(
+            capture_logit,
+            fine_inverse,
+            float(model.consensus_temperature),
+            near_bias=model.consensus_near_bias,
+            background_logit=model.consensus_background_logit,
+            top_k=model.consensus_top_k,
+        )
+        render_weights = _peak_render_weights(
+            consensus_weights,
+            float(model.peak_power),
+            fine_inverse,
+            window_width=float(model.peak_render_window),
+        )
+        color = torch.sum(render_weights * sample_colors, dim=1)
+        # Physical transparency decides how much of the ray is empty, and
+        # the consensus background vote clears rays with no confident
+        # surface. This keeps background rays from inheriting object fog.
+        alpha_visibility = weights.sum(dim=1).clamp(max=1.0)
+        physical_color = torch.sum(weights * sample_colors, dim=1)
+        visibility = (
+            alpha_visibility * (1.0 - bg_weight[..., 0])
+        ).clamp(0.0, 1.0)
         background = model.background.to(color.dtype)
-        rendered = color + residual * background
+        rendered = color * visibility + background * (1.0 - visibility)
+        physical_rendered = (
+            physical_color + background * (1.0 - alpha_visibility)
+        )
+
+        coarse_colors = torch.sigmoid(coarse_logits[..., 0:3])
+        coarse_color = torch.sum(coarse_weights * coarse_colors, dim=1)
+        coarse_visibility = coarse_weights.sum(dim=1)
+        coarse_residual = torch.clamp(1.0 - coarse_visibility, min=0.0)
+        coarse_rendered = (
+            coarse_color + coarse_residual * background
+        )
+    if return_detail:
+        return (
+            rendered,
+            weights,
+            sample_alpha,
+            visibility,
+            fine_positions,
+            coarse_rendered,
+            sample_gates,
+            consensus_weights,
+            bg_weight,
+            physical_rendered,
+        )
     return rendered
 
 
@@ -400,13 +1209,28 @@ def render_rays_chunk_geometry(
     fine_samples: int = 16,
     readout_chunk: int = 131072,
     use_amp: bool = True,
+    jitter: bool = False,
+    anchor_depth: torch.Tensor | None = None,
+    anchor_spread: float = 0.08,
+    anchor_spread_fraction: float | None = None,
+    anchor_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Render one ray batch and also return the 3D vote position."""
+    """Render one ray batch and return the 3D vote position.
+
+    Like ``render_rays_chunk``, the final color and expected position come
+    from the fine chain only, so extraction stays consistent with the
+    rendered image.
+    """
+    if anchor_spread_fraction is None:
+        anchor_spread_fraction = float(
+            getattr(model, "anchor_spread_fraction", 0.0)
+        )
     device = origins.device
     with torch.autocast("cuda", enabled=use_amp and device.type == "cuda"):
-        coarse_positions, inverse_depths = _sample_rays(
-            origins, directions, near, far, coarse_samples
+        coarse_positions, coarse_inverse = _sample_rays(
+            origins, directions, near, far, coarse_samples, jitter=jitter
         )
+        inverse_span = float(coarse_inverse[0, 0] - coarse_inverse[0, -1])
         coarse_logits = model.readout_logits(
             coarse_positions.reshape(-1, 3),
             directions.unsqueeze(1).expand_as(coarse_positions).reshape(-1, 3),
@@ -415,21 +1239,108 @@ def render_rays_chunk_geometry(
         coarse_logits = coarse_logits.reshape(
             origins.shape[0], coarse_samples, 5
         )
-        coarse_color = torch.sigmoid(coarse_logits[..., 0:3])
-        coarse_coherence = coarse_logits[..., 3:4]
-        coarse_gates = torch.sigmoid(coarse_logits[..., 4:5])
-        coarse_weights = _voting_weights(coarse_coherence, coarse_gates)
-        expected_inverse = torch.sum(
-            coarse_weights * inverse_depths.unsqueeze(-1), dim=1
+        temperature = model.coherence_temperature.to(coarse_logits.dtype)
+        alpha_scale = float(model.alpha_scale)
+        coarse_segments = _segment_lengths(coarse_positions, coarse_inverse)
+        anchor_inverse = None
+        anchor_spread_t = None
+        anchor_mask_float = None
+        if anchor_depth is not None:
+            inverse_near = 1.0 / max(float(near), 1e-4)
+            inverse_far = 1.0 / max(float(far), 1e-3)
+            hit_spread = float(anchor_spread)
+            fallback_spread = max((inverse_far - inverse_near) * 0.25, 1e-3)
+            if float(anchor_spread_fraction) > 0.0:
+                max_spread = inverse_span * float(anchor_spread_fraction)
+                hit_spread = min(float(anchor_spread), max_spread)
+                fallback_spread = min(fallback_spread, max_spread)
+            hit_inverse = 1.0 / anchor_depth.clamp(min=1e-4)
+            fallback_inverse = coarse_inverse[:, coarse_samples // 2]
+            if anchor_mask is not None:
+                anchor_mask_float = (anchor_mask > 0).to(torch.float32)
+                mask = (
+                    (anchor_mask > 0).squeeze(-1)
+                    if anchor_mask.dim() > 1
+                    else (anchor_mask > 0)
+                )
+                hit_inverse_flat = (
+                    hit_inverse.squeeze(-1)
+                    if hit_inverse.dim() > 1
+                    else hit_inverse
+                )
+                anchor_inverse = torch.where(mask, hit_inverse_flat, fallback_inverse)
+                anchor_spread_t = torch.where(
+                    mask,
+                    torch.full_like(hit_inverse_flat, hit_spread),
+                    torch.full_like(fallback_inverse, fallback_spread),
+                )
+            else:
+                anchor_inverse = (
+                    hit_inverse.squeeze(-1)
+                    if hit_inverse.dim() > 1
+                    else hit_inverse
+                )
+                anchor_spread_t = torch.full_like(anchor_inverse, hit_spread)
+        coarse_weights = _voting_weights(
+            coarse_logits[..., 3:4],
+            coarse_logits[..., 4:5],
+            temperature,
+            inverse_depth=coarse_inverse,
+            anchor_inverse=anchor_inverse,
+            anchor_spread=anchor_spread_t,
+            anchor_blend=model.anchor_blend,
+            anchor_peak=model.anchor_peak,
+            anchor_mask=anchor_mask_float,
+            segment_lengths=coarse_segments,
+            alpha_scale=alpha_scale,
+            capture_floor=float(model.capture_floor),
+            logit_clamp=float(model.logit_clamp),
         )
 
-        fine_positions, _ = _sample_rays(
+        sampling_weights = coarse_weights
+        if model.coarse_sampling_mode == "consensus":
+            coarse_capture_logit = _capture_logit(
+                coarse_logits[..., 3:4],
+                coarse_logits[..., 4:5],
+                temperature,
+                inverse_depth=coarse_inverse,
+                anchor_inverse=anchor_inverse,
+                anchor_spread=anchor_spread_t,
+                anchor_blend=model.anchor_blend,
+                anchor_peak=model.anchor_peak,
+                anchor_mask=anchor_mask_float,
+                logit_clamp=float(model.logit_clamp),
+                logit_floor=float(model.logit_floor),
+                logit_floor_slope=float(model.logit_floor_slope),
+            )
+            sampling_weights, _ = _consensus_weights(
+                coarse_capture_logit,
+                coarse_inverse,
+                float(model.consensus_temperature),
+                near_bias=0.0,
+                background_logit=float(model.consensus_background_logit),
+                top_k=4,
+            )
+
+        if anchor_depth is not None:
+            if anchor_inverse is None:
+                anchor_inverse = 1.0 / anchor_depth.clamp(min=1e-4)
+            if anchor_spread_t is None:
+                anchor_spread_t = torch.full_like(
+                    anchor_inverse, anchor_spread
+                )
+        fine_positions, fine_inverse = _fine_sample_rays(
             origins,
             directions,
             near,
             far,
             fine_samples,
-            fine_inverse=expected_inverse,
+            sampling_weights,
+            coarse_inverse,
+            anchor_inverse=anchor_inverse,
+            anchor_spread=anchor_spread_t,
+            anchor_fraction=float(model.fine_anchor_fraction),
+            sampling_mode=str(model.fine_sampling_mode),
         )
         fine_logits = model.readout_logits(
             fine_positions.reshape(-1, 3),
@@ -437,20 +1348,71 @@ def render_rays_chunk_geometry(
             chunk=readout_chunk,
         )
         fine_logits = fine_logits.reshape(origins.shape[0], fine_samples, 5)
-        fine_color = torch.sigmoid(fine_logits[..., 0:3])
-        fine_coherence = fine_logits[..., 3:4]
-        fine_gates = torch.sigmoid(fine_logits[..., 4:5])
-        fine_weights = _voting_weights(fine_coherence, fine_gates)
 
-        color = torch.sum(fine_weights * fine_color, dim=1)
-        weights_sum = fine_weights.sum(dim=1).clamp(min=1e-6)
+        order = torch.argsort(fine_inverse, dim=1, descending=True)
+        fine_inverse = torch.gather(fine_inverse, 1, order)
+        fine_positions = torch.gather(
+            fine_positions, 1, order.unsqueeze(-1).expand_as(fine_positions)
+        )
+        fine_logits = torch.gather(
+            fine_logits, 1, order.unsqueeze(-1).expand_as(fine_logits)
+        )
+        sample_colors = torch.sigmoid(fine_logits[..., 0:3])
+        fine_segments = _segment_lengths(fine_positions, fine_inverse)
+        weights = _voting_weights(
+            fine_logits[..., 3:4],
+            fine_logits[..., 4:5],
+            temperature,
+            inverse_depth=fine_inverse,
+            anchor_inverse=anchor_inverse,
+            anchor_spread=anchor_spread_t,
+            anchor_blend=model.anchor_blend,
+            anchor_peak=model.anchor_peak,
+            anchor_mask=anchor_mask_float,
+            segment_lengths=fine_segments,
+            alpha_scale=alpha_scale,
+            capture_floor=float(model.capture_floor),
+            logit_clamp=float(model.logit_clamp),
+        )
+        capture_logit = _capture_logit(
+            fine_logits[..., 3:4],
+            fine_logits[..., 4:5],
+            temperature,
+            inverse_depth=fine_inverse,
+            anchor_inverse=anchor_inverse,
+            anchor_spread=anchor_spread_t,
+            anchor_blend=model.anchor_blend,
+            anchor_peak=model.anchor_peak,
+            anchor_mask=anchor_mask_float,
+            logit_clamp=float(model.logit_clamp),
+            logit_floor=float(model.logit_floor),
+            logit_floor_slope=float(model.logit_floor_slope),
+        )
+        consensus_weights, bg_weight = _consensus_weights(
+            capture_logit,
+            fine_inverse,
+            float(model.consensus_temperature),
+            near_bias=model.consensus_near_bias,
+            background_logit=model.consensus_background_logit,
+            top_k=model.consensus_top_k,
+        )
+        render_weights = _peak_render_weights(
+            consensus_weights,
+            float(model.peak_power),
+            fine_inverse,
+            window_width=float(model.peak_render_window),
+        )
+        color = torch.sum(render_weights * sample_colors, dim=1)
+        weights_sum = render_weights.sum(dim=1).clamp(min=1e-6)
         expected_position = torch.sum(
-            fine_weights * fine_positions, dim=1
+            render_weights * fine_positions, dim=1
         ) / weights_sum
-        visibility = fine_weights.sum(dim=1).clamp(max=1.0)
-        residual = torch.clamp(1.0 - visibility, min=0.0)
+        alpha_visibility = weights.sum(dim=1).clamp(max=1.0)
+        visibility = (
+            alpha_visibility * (1.0 - bg_weight[..., 0])
+        ).clamp(0.0, 1.0)
         background = model.background.to(color.dtype)
-        rendered = color + residual * background
+        rendered = color * visibility + background * (1.0 - visibility)
     return rendered, expected_position, visibility
 
 
@@ -464,21 +1426,47 @@ def render_rays(
     coarse_samples: int = 32,
     fine_samples: int = 16,
     use_amp: bool = True,
+    jitter: bool = False,
+    scene_points: torch.Tensor | None = None,
+    depth_tolerance: float = 0.25,
+    anchor_spread: float = 0.08,
 ) -> torch.Tensor:
-    """Render arbitrary ray counts in memory-bounded batches."""
+    """Render arbitrary ray counts in memory-bounded batches.
+
+    When sparse point evidence is supplied, each ray batch is anchored to its
+    nearest projected point so training and inference share the same focused
+    fine sampling strategy.
+    """
     outputs = []
     for start in range(0, origins.shape[0], ray_batch):
         stop = min(start + ray_batch, origins.shape[0])
+        chunk_origins = origins[start:stop]
+        chunk_directions = directions[start:stop]
+        anchor_depth = None
+        anchor_mask = None
+        if scene_points is not None and scene_points.shape[0] > 0:
+            target_depth, hit_mask, _ = _ray_point_targets(
+                chunk_origins,
+                chunk_directions,
+                scene_points,
+                tolerance=depth_tolerance,
+            )
+            anchor_depth = target_depth
+            anchor_mask = hit_mask
         outputs.append(
             render_rays_chunk(
                 model,
-                origins[start:stop],
-                directions[start:stop],
+                chunk_origins,
+                chunk_directions,
                 near,
                 far,
                 coarse_samples=coarse_samples,
                 fine_samples=fine_samples,
                 use_amp=use_amp,
+                jitter=jitter,
+                anchor_depth=anchor_depth,
+                anchor_mask=anchor_mask,
+                anchor_spread=anchor_spread,
             )
         )
     return torch.cat(outputs, dim=0)
@@ -574,6 +1562,146 @@ def _ray_bounds(
     return max(lower * 0.6, 0.05), upper * 1.5
 
 
+def _ray_point_targets(
+    origins: torch.Tensor,
+    directions: torch.Tensor,
+    points: torch.Tensor,
+    tolerance: float = 0.25,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Anchor ray geometry to the sparse point cloud.
+
+    For every ray, find the nearest point projected onto the ray. Rays with a
+    point within ``tolerance`` are treated as surface hits; their expected
+    depth is anchored to that point and confidence scales with proximity.
+    """
+    if points.shape[0] == 0:
+        batch = origins.shape[0]
+        return (
+            torch.zeros(batch, device=origins.device, dtype=origins.dtype),
+            torch.zeros(batch, device=origins.device, dtype=origins.dtype),
+            torch.zeros(batch, device=origins.device, dtype=origins.dtype),
+        )
+    oc = points.unsqueeze(0) - origins.unsqueeze(1)
+    projection = torch.sum(oc * directions.unsqueeze(1), dim=-1)
+    projection = projection.clamp(min=0.0)
+    closest = origins.unsqueeze(1) + projection.unsqueeze(-1) * directions.unsqueeze(1)
+    distance = torch.linalg.norm(closest - points.unsqueeze(0), dim=-1)
+    distance_min, _ = distance.min(dim=1)
+    hit_mask = (distance_min <= tolerance).float()
+    confidence = torch.clamp(1.0 - distance_min / max(tolerance, 1e-6), min=0.0)
+    # Prefer the nearest surface along the ray. A sphere seen edge-on has
+    # near and far points at similar ray distance, and picking the nearest
+    # projection avoids anchoring geometry to the far side of the object.
+    invalid = distance > tolerance
+    masked_projection = torch.where(
+        invalid,
+        torch.full_like(projection, float("inf")),
+        projection,
+    )
+    target_depth, _ = masked_projection.min(dim=1)
+    target_depth = torch.where(
+        hit_mask.bool(),
+        target_depth.clamp(min=0.0),
+        torch.zeros_like(target_depth),
+    )
+    return target_depth, hit_mask, confidence
+
+
+def _build_scaffold(
+    points: torch.Tensor,
+    resolution: int = 64,
+    dilation: int = 2,
+    bounds: float = 1.4,
+) -> torch.Tensor:
+    """Build a dilated occupancy scaffold from the sparse point cloud.
+
+    The scaffold is a coarse 3D grid marking where surface evidence exists.
+    It is used as a soft prior: density is discouraged in cells that contain
+    no point evidence, which prevents the model from hiding behind a shell.
+    """
+    resolution = max(16, int(resolution))
+    device = points.device
+    grid = torch.zeros(
+        resolution * resolution * resolution,
+        device=device,
+        dtype=torch.float32,
+    )
+    if points.shape[0] == 0:
+        return grid
+    coords = (points + bounds) / (2.0 * bounds) * float(resolution - 1)
+    cells = coords.long().clamp(0, resolution - 1)
+    index = (
+        cells[:, 0] * resolution * resolution
+        + cells[:, 1] * resolution
+        + cells[:, 2]
+    )
+    index = index.unique()
+    grid.index_fill_(0, index, 1.0)
+    if dilation > 0:
+        volume = grid.view(1, 1, resolution, resolution, resolution)
+        volume = torch.nn.functional.max_pool3d(
+            volume,
+            kernel_size=2 * dilation + 1,
+            stride=1,
+            padding=dilation,
+        )
+        grid = volume.reshape(-1)
+    return grid.detach()
+
+
+def _sample_scaffold(
+    grid: torch.Tensor,
+    positions: torch.Tensor,
+    resolution: int = 64,
+    bounds: float = 1.4,
+) -> torch.Tensor:
+    """Trilinear sample the scaffold at arbitrary normalized positions."""
+    resolution = max(16, int(resolution))
+    flat = positions.reshape(-1, 3)
+    coords = (flat + bounds) / (2.0 * bounds) * float(resolution - 1)
+    lo = torch.floor(coords).long().clamp(0, resolution - 2)
+    hi = (lo + 1).clamp(0, resolution - 1)
+    fraction = (coords - lo.float()).clamp(0.0, 1.0)
+    fx = fraction[:, 0:1]
+    fy = fraction[:, 1:2]
+    fz = fraction[:, 2:3]
+    stride_y = resolution
+    stride_x = resolution * resolution
+    idx_lo = lo[..., 0] * stride_x + lo[..., 1] * stride_y + lo[..., 2]
+    idx_hi = hi[..., 0] * stride_x + hi[..., 1] * stride_y + hi[..., 2]
+    grid_flat = grid
+    v000 = grid_flat[idx_lo].unsqueeze(-1)
+    v001 = grid_flat[
+        lo[..., 0] * stride_x + lo[..., 1] * stride_y + hi[..., 2]
+    ].unsqueeze(-1)
+    v010 = grid_flat[
+        lo[..., 0] * stride_x + hi[..., 1] * stride_y + lo[..., 2]
+    ].unsqueeze(-1)
+    v011 = grid_flat[
+        lo[..., 0] * stride_x + hi[..., 1] * stride_y + hi[..., 2]
+    ].unsqueeze(-1)
+    v100 = grid_flat[
+        hi[..., 0] * stride_x + lo[..., 1] * stride_y + lo[..., 2]
+    ].unsqueeze(-1)
+    v101 = grid_flat[
+        hi[..., 0] * stride_x + lo[..., 1] * stride_y + hi[..., 2]
+    ].unsqueeze(-1)
+    v110 = grid_flat[
+        hi[..., 0] * stride_x + hi[..., 1] * stride_y + lo[..., 2]
+    ].unsqueeze(-1)
+    v111 = grid_flat[
+        hi[..., 0] * stride_x + hi[..., 1] * stride_y + hi[..., 2]
+    ].unsqueeze(-1)
+    c00 = v000 * (1.0 - fx) + v100 * fx
+    c01 = v001 * (1.0 - fx) + v101 * fx
+    c10 = v010 * (1.0 - fx) + v110 * fx
+    c11 = v011 * (1.0 - fx) + v111 * fx
+    c0 = c00 * (1.0 - fy) + c10 * fy
+    c1 = c01 * (1.0 - fy) + c11 * fy
+    values = c0 * (1.0 - fz) + c1 * fz
+    return values.reshape(positions.shape[:-1])
+
+
 def _voxel_sample(points: np.ndarray, max_points: int) -> np.ndarray:
     """Downsample a dense point cloud with a deterministic voxel grid."""
     if len(points) <= max_points:
@@ -612,6 +1740,7 @@ def extract_dense_points(
     visibility_threshold: float = 0.2,
     max_points: int = 200000,
     use_amp: bool = True,
+    depth_tolerance: float = 0.25,
 ) -> list[float]:
     """Extract a dense colored 3D point cloud from the trained field.
 
@@ -621,6 +1750,12 @@ def extract_dense_points(
     """
     model.to(device)
     shift = shift.to(device)
+    anchor_points = None
+    if len(scene_points):
+        anchor_points = torch.from_numpy(
+            _voxel_sample(scene_points.astype(np.float32), 20000)
+        ).to(device)
+        anchor_points = (anchor_points - shift) * scale
     chunks: list[np.ndarray] = []
     with torch.no_grad():
         for camera in cameras:
@@ -640,16 +1775,31 @@ def extract_dense_points(
             )
             for start in range(0, origins_scaled.shape[0], ray_batch):
                 stop = min(start + ray_batch, origins_scaled.shape[0])
+                chunk_origins = origins_scaled[start:stop]
+                chunk_directions = directions[start:stop]
+                anchor_depth = None
+                anchor_mask = None
+                if anchor_points is not None:
+                    target_depth, hit_mask, _ = _ray_point_targets(
+                        chunk_origins,
+                        chunk_directions,
+                        anchor_points,
+                        tolerance=depth_tolerance,
+                    )
+                    anchor_depth = target_depth
+                    anchor_mask = hit_mask
                 rendered, expected_position, visibility = (
                     render_rays_chunk_geometry(
                         model,
-                        origins_scaled[start:stop],
-                        directions[start:stop],
+                        chunk_origins,
+                        chunk_directions,
                         near,
                         far,
                         coarse_samples=coarse_samples,
                         fine_samples=fine_samples,
                         use_amp=use_amp,
+                        anchor_depth=anchor_depth,
+                        anchor_mask=anchor_mask,
                     )
                 )
                 rendered = rendered.float().cpu().numpy()
@@ -691,6 +1841,11 @@ def train_tcf(
     else:
         log("[tcf] 使用 CPU 训练（未检测到 CUDA）")
 
+    seed = int(config.get("seed", 2026))
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
     model = TitanCoherenceField(config).to(device)
     scene_points = (
         np.asarray(sparse_points, dtype=np.float32)[:, :3]
@@ -724,16 +1879,108 @@ def train_tcf(
     learning_rate = float(config.get("learning_rate", 0.01))
     lr_end = float(config.get("learning_rate_end", 0.002))
     use_amp = bool(config.get("mixed_precision", True))
-    background_weight = float(config.get("background_weight", 0.02))
+    background_weight = float(config.get("background_weight", 0.1))
+    occupancy_weight = float(config.get("occupancy_regularization", 0.01))
+    visibility_weight = float(config.get("visibility_regularization", 0.02))
+    background_slot_weight = float(
+        config.get("background_slot_regularization", 0.1)
+    )
+    visibility_target_min = float(
+        config.get("visibility_target_min", 0.9)
+    )
+    visibility_target_max = float(
+        config.get("visibility_target_max", 1.0)
+    )
+    visibility_upper_cap = float(config.get("visibility_upper_cap", 1.0))
+    visibility_upper_weight = float(
+        config.get("visibility_upper_regularization", 0.0)
+    )
+    background_slot_cap = float(config.get("background_slot_cap", 0.25))
+    background_slot_cap_weight = float(
+        config.get("background_slot_cap_regularization", 0.0)
+    )
+    background_bonus_weight = float(
+        config.get("background_bonus_regularization", 0.05)
+    )
+    consensus_entropy_weight = float(
+        config.get("consensus_entropy_regularization", 0.02)
+    )
+    consensus_margin_weight = float(
+        config.get("consensus_margin_regularization", 0.05)
+    )
+    sharpness_weight = float(config.get("sharpness_regularization", 0.05))
+    geometry_weight = float(config.get("geometry_regularization", 1.0))
+    scaffold_weight = float(config.get("scaffold_regularization", 0.5))
+    scaffold_resolution = int(config.get("scaffold_resolution", 64))
+    depth_dist_weight = float(config.get("depth_distribution_regularization", 2.0))
+    depth_sigma = float(config.get("depth_sigma", 0.1))
+    surface_weight = float(config.get("surface_regularization", 1.0))
+    peak_weight = float(config.get("peak_regularization", 0.6))
+    surface_density = float(config.get("surface_density", 5.0))
+    surface_density_weight = float(
+        config.get("surface_density_regularization", 0.0)
+    )
+    surface_density_outside = float(
+        config.get("surface_density_outside", 0.2)
+    )
+    geometry_warmup = max(0, int(config.get("geometry_warmup", 120)))
+    density_floor = float(config.get("density_floor", 0.3))
+    density_floor_weight = float(config.get("density_floor_regularization", 0.0))
+    readout_lr_scale = float(config.get("readout_lr_scale", 0.3))
+    depth_tolerance = float(config.get("depth_tolerance", 0.25))
+    spatial_patch = bool(config.get("spatial_patch", True))
+    anchor_spread = float(config.get("anchor_spread", 0.08))
+    voting_temp_start = float(config.get("voting_temperature_start", 0.5))
+    voting_temp_end = float(config.get("voting_temperature_end", 6.0))
+    consensus_temp_start = float(
+        config.get("consensus_temperature_start", 1.5)
+    )
+    consensus_temp_end = float(
+        config.get("consensus_temperature_end", 0.6)
+    )
+    anchor_blend_start = float(config.get("anchor_blend_start", 1.0))
+    anchor_blend_end = float(config.get("anchor_blend_end", 0.0))
+    anchor_blend_fraction = float(config.get("anchor_blend_fraction", 0.6))
+    coarse_color_weight = float(config.get("coarse_color_weight", 0.5))
+    physical_color_weight = float(config.get("physical_color_weight", 0.0))
 
     train_parameters = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(train_parameters, lr=learning_rate, weight_decay=0.0)
+    lattice_ids = {id(p) for p in model.lattice.params()}
+    readout_parameters = [
+        p
+        for p in train_parameters
+        if id(p) not in lattice_ids and p is not model.background
+    ]
+    optimizer = torch.optim.Adam(
+        [
+            {"params": list(model.lattice.params()), "lr": learning_rate},
+            {"params": readout_parameters, "lr": learning_rate * readout_lr_scale},
+        ],
+        betas=(0.9, 0.99),
+        eps=1e-8,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=steps, eta_min=lr_end
     )
-    rng = np.random.default_rng(2026)
+    training_seed = int(config.get("training_seed", 2026))
+    torch.manual_seed(training_seed)
+    torch.cuda.manual_seed_all(training_seed)
+    np.random.seed(training_seed)
+    rng = np.random.default_rng(training_seed)
     history: list[dict] = []
     start_wall = time.time()
+
+    scene_points_t = (
+        torch.from_numpy(
+            _voxel_sample(scene_points.astype(np.float32), 30000)
+        ).to(device)
+        if len(scene_points)
+        else torch.empty((0, 3), device=device, dtype=torch.float32)
+    )
+    scaffold_grid = _build_scaffold(
+        (scene_points_t - shift) * scale,
+        resolution=scaffold_resolution,
+    )
 
     log(
         f"[tcf] 开始：{len(train_cameras)} 训练视角，{steps} 步，"
@@ -811,15 +2058,67 @@ def train_tcf(
                         "latticeMB": model.lattice_mb(),
                     }
                 )
+        temp_fraction = (step + 1) / max(steps, 1)
+        voting_temp = voting_temp_start + 0.5 * (
+            voting_temp_end - voting_temp_start
+        ) * (1.0 - math.cos(math.pi * temp_fraction))
+        model.coherence_temperature.fill_(voting_temp)
+        anchor_frac = min(
+            1.0, temp_fraction / max(anchor_blend_fraction, 1e-3)
+        )
+        anchor_blend = anchor_blend_start + 0.5 * (
+            anchor_blend_end - anchor_blend_start
+        ) * (1.0 - math.cos(math.pi * anchor_frac))
+        model.anchor_blend.fill_(anchor_blend)
+        peak_power = model.peak_render_start + 0.5 * (
+            model.peak_render_end - model.peak_render_start
+        ) * (1.0 - math.cos(math.pi * temp_fraction))
+        model.peak_power.fill_(peak_power)
+        capture_floor = model.capture_floor_start + 0.5 * (
+            model.capture_floor_end - model.capture_floor_start
+        ) * (1.0 - math.cos(math.pi * temp_fraction))
+        model.capture_floor.fill_(capture_floor)
+        consensus_temp = consensus_temp_start + 0.5 * (
+            consensus_temp_end - consensus_temp_start
+        ) * (1.0 - math.cos(math.pi * temp_fraction))
+        model.consensus_temperature.fill_(consensus_temp)
+
         camera_index = int(rng.integers(0, len(train_cameras)))
         camera = train_cameras[camera_index]
         image = images[camera_index] if camera_index < len(images) else images[0]
         height, width = int(camera["height"]), int(camera["width"])
-        ys = rng.integers(0, height, size=patch)
-        xs = rng.integers(0, width, size=patch)
+        total_pixels = height * width
+        sample_count = min(patch, total_pixels)
+        if spatial_patch:
+            side = max(8, int(round(math.sqrt(sample_count))))
+            side = min(side, height, width)
+            y0 = int(rng.integers(0, max(1, height - side + 1)))
+            x0 = int(rng.integers(0, max(1, width - side + 1)))
+            ys_grid, xs_grid = np.meshgrid(
+                np.arange(y0, y0 + side),
+                np.arange(x0, x0 + side),
+                indexing="ij",
+            )
+            ys = ys_grid.reshape(-1).astype(np.int64)
+            xs = xs_grid.reshape(-1).astype(np.int64)
+        else:
+            flat_indices = rng.choice(
+                total_pixels, size=sample_count, replace=False
+            )
+            ys = (flat_indices // width).astype(np.int64)
+            xs = (flat_indices % width).astype(np.int64)
         origins, directions = _camera_rays_from_pose(camera, device, ys, xs)
         origins_scaled = (origins - shift) * scale
         near, far = _ray_bounds(origins_scaled, scene_points, radius, scale, shift)
+        target_depth, hit_mask, depth_confidence = _ray_point_targets(
+            origins_scaled,
+            directions,
+            (scene_points_t - shift) * scale,
+            tolerance=depth_tolerance,
+        )
+        visibility_target = visibility_target_min + (
+            visibility_target_max - visibility_target_min
+        ) * depth_confidence
         target = torch.tensor(
             image[ys, xs].astype(np.float32), device=device, dtype=torch.float32
         )
@@ -828,7 +2127,18 @@ def train_tcf(
         with torch.autocast(
             "cuda", enabled=use_amp and device.type == "cuda"
         ):
-            rendered = render_rays_chunk(
+            (
+                rendered,
+                weights,
+                sample_alpha,
+                visibility,
+                sample_positions,
+                coarse_rendered,
+                sample_gates,
+                consensus_weights,
+                bg_weight,
+                physical_rendered,
+            ) = render_rays_chunk(
                 model,
                 origins_scaled,
                 directions,
@@ -838,17 +2148,284 @@ def train_tcf(
                 fine_samples=fine_samples,
                 readout_chunk=readout_chunk,
                 use_amp=use_amp,
+                jitter=True,
+                anchor_depth=target_depth,
+                anchor_spread=anchor_spread,
+                anchor_mask=hit_mask,
+                return_detail=True,
+            )
+            sample_depths = torch.sum(
+                (sample_positions - origins_scaled.unsqueeze(1))
+                * directions.unsqueeze(1),
+                dim=-1,
+            )
+            render_weights = _peak_render_weights(
+                consensus_weights,
+                float(model.peak_power),
+                (1.0 / sample_depths.clamp(min=1e-6)),
+                window_width=float(model.peak_render_window),
+            )
+            consensus_vote = render_weights[..., 0]
+            weights_sum = consensus_vote.sum(dim=1).clamp(min=1e-6)
+            expected_depth = (
+                torch.sum(consensus_vote * sample_depths, dim=1) / weights_sum
+            )
+            depth_sq = (
+                torch.sum(
+                    consensus_vote * sample_depths**2,
+                    dim=1,
+                )
+                / weights_sum
+            )
+            depth_variance = (depth_sq - expected_depth**2).clamp(min=0.0)
+            scaffold_values = _sample_scaffold(
+                scaffold_grid,
+                sample_positions,
+                resolution=scaffold_resolution,
+            )
+            scaffold_penalty = torch.mean(
+                sample_alpha[..., 0] * (1.0 - scaffold_values)
             )
             color_loss = torch.mean((rendered - target) ** 2)
-            bg_penalty = torch.mean(torch.relu(-model.background)) * background_weight
-            loss = color_loss + bg_penalty
+            coarse_color_loss = torch.mean((coarse_rendered - target) ** 2)
+            physical_color_loss = torch.mean(
+                (physical_rendered - target) ** 2
+            )
+            occupancy_penalty = torch.mean(
+                sample_alpha * (1.0 - sample_alpha)
+            )
+            visibility_penalty = torch.mean(
+                hit_mask * torch.relu(visibility_target - visibility) ** 2
+                + (1.0 - hit_mask) * visibility**2
+            )
+            visibility_upper_penalty = torch.mean(
+                hit_mask
+                * torch.relu(visibility - visibility_upper_cap) ** 2
+            )
+            weights_norm = consensus_vote / weights_sum.unsqueeze(1)
+            bg_conf = bg_weight[..., 0]
+            background_slot_penalty = torch.mean(
+                torch.relu(bg_conf - background_slot_cap) ** 2
+                + background_bonus_weight
+                * (1.0 - hit_mask)
+                * torch.relu(1.0 - bg_conf) ** 2
+            )
+            raw_consensus = consensus_weights[..., 0]
+            sharpness_penalty = torch.mean(
+                hit_mask * (1.0 - raw_consensus.max(dim=1).values)
+            )
+            consensus_entropy = -torch.sum(
+                raw_consensus * torch.log(raw_consensus.clamp(min=1e-6)),
+                dim=1,
+            )
+            entropy_penalty = torch.mean(hit_mask * consensus_entropy)
+            consensus_top2 = torch.topk(raw_consensus, 2, dim=1).values
+            consensus_margin_penalty = torch.mean(
+                hit_mask
+                * torch.relu(
+                    0.12 - (consensus_top2[:, 0] - consensus_top2[:, 1])
+                )
+            )
+            target_gauss = torch.exp(
+                -0.5
+                * (
+                    (sample_depths - target_depth.unsqueeze(1))
+                    / max(float(depth_sigma), 1e-3)
+                )
+                ** 2
+            )
+            target_weights = target_gauss / target_gauss.sum(
+                dim=1, keepdim=True
+            ).clamp(min=1e-6)
+            surface_energy = (
+                torch.sum(consensus_vote * target_gauss, dim=1) / weights_sum
+            )
+            peak_penalty = torch.mean(
+                hit_mask
+                * depth_confidence
+                * (1.0 - surface_energy.clamp(min=0.0, max=1.0))
+            )
+            depth_scale = max(float(far - near), 1e-3)
+            geometry_penalty = torch.mean(
+                depth_confidence
+                * hit_mask
+                * (
+                    ((expected_depth - target_depth) / depth_scale) ** 2
+                    + depth_variance / depth_scale**2
+                    + surface_weight * (1.0 - surface_energy) ** 2
+                )
+            )
+            depth_dist_penalty = torch.mean(
+                hit_mask
+                * depth_confidence
+                * torch.sum(
+                    (weights_norm - target_weights) ** 2,
+                    dim=1,
+                )
+            )
+            depth_segments = torch.abs(
+                sample_depths[:, 1:] - sample_depths[:, :-1]
+            )
+            depth_segments = torch.cat(
+                [
+                    depth_segments,
+                    depth_segments[:, -1:],
+                ],
+                dim=1,
+            ).unsqueeze(-1)
+            density = torch.nn.functional.softplus(sample_gates) / depth_segments.clamp(
+                min=1e-6
+            )
+            density_floor_penalty = torch.mean(
+                hit_mask
+                * torch.relu(
+                    density_floor - density.max(dim=1).values.unsqueeze(-1)
+                )
+            )
+            surface_mask = hit_mask * depth_confidence
+            target_gauss_3d = target_gauss.unsqueeze(-1)
+            surface_density_penalty = torch.mean(
+                surface_mask.unsqueeze(-1).unsqueeze(-1)
+                * (
+                    torch.relu(surface_density - density) * target_gauss_3d
+                    + surface_density_outside
+                    * density
+                    * (1.0 - target_gauss_3d)
+                )
+            )
+            bg_target = model.background_target.to(model.background.dtype)
+            bg_penalty = (
+                torch.mean((model.background - bg_target) ** 2)
+                + 0.02 * torch.mean(torch.relu(-model.background))
+            ) * background_weight
+            geometry_scale = min(1.0, (step + 1) / max(geometry_warmup, 1))
+            reg_scale = 1.0 - 0.6 * temp_fraction
+            physical_color_scale = physical_color_weight * (
+                1.0 - 0.8 * temp_fraction
+            )
+            loss = (
+                color_loss
+                + coarse_color_weight * coarse_color_loss
+                + physical_color_scale * physical_color_loss
+                + occupancy_weight * occupancy_penalty
+                + visibility_weight * visibility_penalty
+                + visibility_upper_weight * visibility_upper_penalty
+                + background_slot_weight * background_slot_penalty
+                + background_slot_cap_weight
+                * background_slot_penalty
+                + reg_scale * sharpness_weight * sharpness_penalty
+                + reg_scale * consensus_entropy_weight * entropy_penalty
+                + reg_scale * consensus_margin_weight * consensus_margin_penalty
+                + reg_scale * geometry_weight * geometry_scale * geometry_penalty
+                + reg_scale * peak_weight * geometry_scale * peak_penalty
+                + reg_scale * scaffold_weight * geometry_scale * scaffold_penalty
+                + reg_scale * depth_dist_weight * geometry_scale * depth_dist_penalty
+                + reg_scale * density_floor_weight * density_floor_penalty
+                + reg_scale * surface_density_weight * geometry_scale * surface_density_penalty
+                + bg_penalty
+            )
+        if not torch.isfinite(loss):
+            components = {
+                "rendered": rendered,
+                "weights": weights,
+                "sample_alpha": sample_alpha,
+                "visibility": visibility,
+                "visibility_upper": visibility_upper_penalty,
+                "sample_positions": sample_positions,
+                "coarse_rendered": coarse_rendered,
+                "sample_gates": sample_gates,
+                "consensus_weights": consensus_weights,
+                "bg_weight": bg_weight,
+            }
+            bad = [
+                name
+                for name, tensor in components.items()
+                if not torch.isfinite(tensor.float()).all()
+            ]
+            log(
+                f"[tcf] non-finite loss at step {step} "
+                f"loss={float(loss)} bad={bad} "
+                f"color={float(color_loss):.6f} "
+                f"coarse={float(coarse_color_loss):.6f} "
+                f"occ={float(occupancy_penalty):.6f} "
+                f"vis={float(visibility_penalty):.6f} "
+                f"bslot={float(background_slot_penalty):.6f} "
+                f"sharp={float(sharpness_penalty):.6f} "
+                f"entropy={float(entropy_penalty):.6f} "
+                f"margin={float(consensus_margin_penalty):.6f} "
+                f"geo={float(geometry_penalty):.6f} "
+                f"peak={float(peak_penalty):.6f} "
+                f"scaf={float(scaffold_penalty):.6f} "
+                f"dist={float(depth_dist_penalty):.6f} "
+                f"dfloor={float(density_floor_penalty):.6f} "
+                f"sdfd={float(surface_density_penalty):.6f}"
+            )
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(train_parameters, 1.0)
+        if os.environ.get("TITAN_DBG_GRAD") and step == 0:
+            with torch.no_grad():
+                grad_items = []
+                bias_grad = model.readout.linear_out.bias.grad
+                if bias_grad is not None:
+                    grad_items.append(
+                        "out_bias_grad="
+                        + str(bias_grad.detach().cpu().numpy().tolist())
+                    )
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_items.append(
+                            f"{name}:norm={float(param.grad.norm()):.4f}"
+                            f",mean={float(param.grad.mean()):.6f}"
+                        )
+                log("[tcf:dbg:grad] " + " | ".join(grad_items))
         optimizer.step()
         scheduler.step()
 
         loss_value = float(loss.detach().cpu())
+        if os.environ.get("TITAN_DEBUG") and step % 10 == 0:
+            with torch.no_grad():
+                log(
+                    "[tcf:dbg] step {} hit {:.3f} vis {:.3f} alpha {:.4f} "
+                    "ed {:.3f} td {:.3f} loss c {:.5f} occ {:.6f} "
+                    "visp {:.6f} bslot {:.6f} sharp {:.6f} "
+                    "entropy {:.6f} margin {:.6f} geo {:.6f} "
+                    "peak {:.6f} "
+                    "scaf {:.6f} dist {:.6f} dfloor {:.6f} "
+                    "sdfd {:.6f} conf {:.3f} gate {:.3f} bg {:.3f} "
+                    "floor {:.3f} cwmax {:.3f} bgw {:.3f} "
+                    "ctemp {:.3f}".format(
+                        step,
+                        float(hit_mask.mean()),
+                        float(visibility.mean()),
+                        float(sample_alpha.mean()),
+                        float(expected_depth.mean()),
+                        float(target_depth.mean()),
+                        float(color_loss),
+                        float(occupancy_penalty),
+                        float(visibility_penalty),
+                        float(background_slot_penalty),
+                        float(visibility_upper_penalty),
+                        float(sharpness_penalty),
+                        float(entropy_penalty),
+                        float(consensus_margin_penalty),
+                        float(geometry_penalty),
+                        float(peak_penalty),
+                        float(scaffold_penalty),
+                        float(depth_dist_penalty),
+                        float(density_floor_penalty),
+                        float(surface_density_penalty),
+                        float(depth_confidence.mean()),
+                        float(sample_gates.mean()),
+                        float(model.background.mean()),
+                        float(model.capture_floor),
+                        float(
+                            consensus_weights.max(dim=1).values.mean()
+                        ),
+                        float(bg_weight.mean()),
+                        float(model.consensus_temperature),
+                    )
+                )
         if step % progress_every == 0 or step == steps - 1:
             payload = {
                 "taskId": task_id,
@@ -913,6 +2490,11 @@ def train_tcf(
                     }
                 )
 
+    model.coherence_temperature.fill_(voting_temp_end)
+    model.anchor_blend.fill_(anchor_blend_end)
+    model.peak_power.fill_(model.peak_render_end)
+    model.capture_floor.fill_(model.capture_floor_end)
+    model.consensus_temperature.fill_(consensus_temp_end)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     model.to("cpu")
@@ -936,14 +2518,39 @@ def render_tcf_view(
     scene_points: np.ndarray,
     radius: float,
     ray_batch: int = 4096,
-    coarse_samples: int = 32,
-    fine_samples: int = 16,
+    coarse_samples: int | None = None,
+    fine_samples: int | None = None,
     use_amp: bool = True,
+    depth_tolerance: float = 0.25,
+    anchor_spread: float = 0.08,
 ) -> np.ndarray:
     """Render a full view with a memory-bounded ray loop."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    if coarse_samples is None:
+        coarse_samples = int(getattr(model, "coarse_samples", 32))
+    if fine_samples is None:
+        fine_samples = int(getattr(model, "fine_samples", 16))
+    model.coherence_temperature.fill_(
+        getattr(model, "voting_temperature_end", 6.0)
+    )
+    model.anchor_blend.fill_(getattr(model, "anchor_blend_end", 0.0))
+    model.peak_power.fill_(
+        getattr(model, "peak_render_end", 3.0)
+    )
+    model.capture_floor.fill_(
+        getattr(model, "capture_floor_end", 0.06)
+    )
+    model.consensus_temperature.fill_(
+        getattr(model, "consensus_temperature_end", 0.6)
+    )
     shift = shift.to(device)
+    anchor_points = None
+    if len(scene_points):
+        anchor_points = torch.from_numpy(
+            _voxel_sample(scene_points.astype(np.float32), 20000)
+        ).to(device)
+        anchor_points = (anchor_points - shift) * scale
     origins, directions = _camera_rays_from_pose(camera, device)
     origins_scaled = (origins - shift) * scale
     near, far = _ray_bounds(origins_scaled, scene_points, radius, scale, shift)
@@ -958,6 +2565,9 @@ def render_tcf_view(
             coarse_samples=coarse_samples,
             fine_samples=fine_samples,
             use_amp=use_amp,
+            scene_points=anchor_points,
+            depth_tolerance=depth_tolerance,
+            anchor_spread=anchor_spread,
         )
     image = rendered.detach().cpu().numpy()
     height, width = int(camera["height"]), int(camera["width"])

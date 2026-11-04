@@ -8,23 +8,23 @@ export interface ReconstructionSettings {
 
 const STORAGE_KEY = "titan.reconstruction.v1";
 export const TRAINING_STEPS_MIN = 100;
-export const TRAINING_STEPS_MAX = 10000;
+export const TRAINING_STEPS_MAX = 50000;
 
 const QUALITY_PRESETS: Record<TrainingQuality, ReconstructionSettings> = {
   original: {
     quality: "original",
     maxImagePixels: 2_000_000,
-    steps: 1200,
+    steps: 4800,
   },
   balanced: {
     quality: "balanced",
     maxImagePixels: 1_000_000,
-    steps: 800,
+    steps: 2400,
   },
   compact: {
     quality: "compact",
     maxImagePixels: 500_000,
-    steps: 500,
+    steps: 1200,
   },
 };
 

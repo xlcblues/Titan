@@ -29,6 +29,10 @@ __pycache__/
 
 # Temporary experiment workspaces
 /.tmp_*/
+/.bench*/
+/.bench_*.log
+python/bench_*.py
+python/diag_*.py
 
 # CUDA extension build artifacts and scratch probes
 python/titan_engine/tile_cuda/build/

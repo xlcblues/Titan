@@ -1,11 +1,11 @@
 {
-  "version": "0.2.0",
-  "notes": "Titan update",
-  "pub_date": "2026-11-03T13:38:39.913Z",
+  "version": "0.2.1",
+  "notes": "fern 评测确认的 TCF 算法优化：收敛更稳定，eval PSNR 17.15 / SSIM 0.427；默认长训练配置与 peak 采样",
+  "pub_date": "2026-11-04T11:02:37.428Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUajRKTVc1c3JXdjdSL2wrV25CaU4vcThibmVLL1Z1SkhSZmN2V1R1dDMrcHI1Mi9mTnM2b053VW51WnlsV1hYNGI5bWNsZm5FcFhxbUtxcWxJcVdPNWo0WGRuTUl0WUFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNzEzMTE5CWZpbGU6VGl0YW5fMC4yLjBfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMi4wCmk4b0RCei82UVJsUUNSYjhydHloWWlTNmRWZllkaFZWK09UdU9vQllsS0kwUndPRFNMK1JMUndKZ0RWc3Q1cmttMDg2UEZ3aTdTalFPWnFJbk1CdUFBPT0K",
-      "url": "https://github.com/xlcblues/Titan/releases/download/v0.2.0/Titan_0.2.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUajRKTVc1c3JXdjVFN3ZCOTNGOC9OYlZLM3VaUUFlRVZOcGZUanBkelM1T21HMnFWZ2FxZ3RMYVBBZEZUUUZUaUJ4U0V2NnVGbnhQSFh6WkxlZVhHQkwvNU9Qdy9zNEFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNzkwMTU3CWZpbGU6VGl0YW5fMC4yLjFfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMi4xClN5QW5UWlVaWFJlQ2VDWE04NVVhdzFvRVBzQ3hrcDhWNGRiTXZPYllHbzhQZm1pYVJlWW5GTE8vdnRvWGNPZnNvNG5PeUkzaTc1VlYwUVh0MTdaekFRPT0K",
+      "url": "https://github.com/xlcblues/Titan/releases/download/v0.2.1/Titan_0.2.1_x64-setup.exe"
     }
   }
 }

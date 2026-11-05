@@ -58,9 +58,9 @@ class CoherentLattice(nn.Module):
         levels: int = 8,
         base_resolution: int = 32,
         scale: float = 1.6,
-        max_resolution: int = 512,
-        entries_per_level: int = 131072,
-        feature_dim: int = 8,
+        max_resolution: int = 1024,
+        entries_per_level: int = 196608,
+        feature_dim: int = 16,
         seed: int = 11,
     ) -> None:
         super().__init__()
@@ -99,9 +99,9 @@ class CoherenceReadout(nn.Module):
         self,
         feature_dim: int = 8,
         levels: int = 8,
-        position_levels: int = 4,
-        direction_levels: int = 2,
-        hidden: int = 96,
+        position_levels: int = 6,
+        direction_levels: int = 3,
+        hidden: int = 144,
         seed: int = 12,
         context_scale: float = 8.0,
         coherence_bias: float = 0.0,
@@ -168,16 +168,16 @@ class TitanCoherenceField(nn.Module):
             levels=levels,
             base_resolution=int(config.get("lattice_base_resolution", 32)),
             scale=float(config.get("lattice_scale", 1.6)),
-            max_resolution=int(config.get("lattice_max_resolution", 512)),
-            entries_per_level=int(config.get("lattice_entries", 131072)),
-            feature_dim=int(config.get("lattice_feature_dim", 8)),
+            max_resolution=int(config.get("lattice_max_resolution", 1024)),
+            entries_per_level=int(config.get("lattice_entries", 196608)),
+            feature_dim=int(config.get("lattice_feature_dim", 16)),
         )
         self.readout = CoherenceReadout(
-            feature_dim=int(config.get("lattice_feature_dim", 8)),
+            feature_dim=int(config.get("lattice_feature_dim", 16)),
             levels=levels,
-            position_levels=int(config.get("position_levels", 4)),
-            direction_levels=int(config.get("direction_levels", 2)),
-            hidden=int(config.get("readout_hidden", 96)),
+            position_levels=int(config.get("position_levels", 6)),
+            direction_levels=int(config.get("direction_levels", 3)),
+            hidden=int(config.get("readout_hidden", 144)),
             context_scale=float(config.get("lattice_context_scale", 0.5)),
             coherence_bias=float(
                 config.get("coherence_bias", config.get("density_bias", 0.0))
@@ -211,10 +211,8 @@ class TitanCoherenceField(nn.Module):
         self.consensus_near_bias = float(
             config.get("consensus_near_bias", 0.5)
         )
-        self.consensus_background_logit = float(
-            config.get("consensus_background_logit", 0.0)
-        )
         self.consensus_top_k = int(config.get("consensus_top_k", 2))
+        self.render_top_k = max(1, int(config.get("render_top_k", 1)))
         self.coarse_samples = int(config.get("coarse_samples", 32))
         self.fine_samples = int(config.get("fine_samples", 16))
         self.consensus_sharp_start = float(
@@ -223,9 +221,20 @@ class TitanCoherenceField(nn.Module):
         self.consensus_sharp_end = float(
             config.get("consensus_sharp_end", 1.0)
         )
-        self.register_buffer(
-            "background", torch.tensor([0.08, 0.09, 0.10], dtype=torch.float32)
+        self.register_parameter(
+            "background",
+            nn.Parameter(
+                torch.tensor([0.08, 0.09, 0.10], dtype=torch.float32)
+            ),
         )
+        if "background_color" in config:
+            with torch.no_grad():
+                self.background.copy_(
+                    torch.tensor(
+                        [float(v) for v in config["background_color"]],
+                        dtype=torch.float32,
+                    )
+                )
         self.register_buffer(
             "coherence_temperature",
             torch.tensor(self.voting_temperature_end, dtype=torch.float32),
@@ -277,9 +286,6 @@ class TitanCoherenceField(nn.Module):
         )
         self.fine_anchor_fraction = float(
             config.get("fine_anchor_fraction", 0.4)
-        )
-        self.peak_render_window = float(
-            config.get("peak_render_window", 2.2)
         )
         self.coarse_sampling_mode = str(
             config.get("coarse_sampling_mode", "physical")
@@ -478,23 +484,46 @@ def _capture_logit(
     return capture_logit
 
 
+def _soft_top_k(
+    weights: torch.Tensor,
+    top_k: int,
+    temperature: float = 0.2,
+) -> torch.Tensor:
+    """Differentiable approximation of keeping the top-k positive weights.
+
+    A hard ``torch.topk`` + scatter blocks gradients from reaching samples
+    that are not selected, so the color loss cannot teach the vote which
+    depth to choose. This version gates by the (k+1)-th largest value with a
+    smooth sigmoid, preserving near top-k sparsity while keeping selection
+    gradients alive.
+    """
+    if top_k <= 0 or weights.shape[1] <= top_k:
+        return weights
+    flat = weights[..., 0]
+    sorted_values, _ = torch.sort(flat, dim=1, descending=True)
+    threshold = sorted_values[:, top_k : top_k + 1]
+    scaled = (flat - threshold) / max(float(temperature), 1e-4)
+    mask = torch.sigmoid(scaled).clamp(min=0.0, max=1.0)
+    masked = weights * mask.unsqueeze(-1)
+    return masked / masked.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+
 def _consensus_weights(
     capture_logit: torch.Tensor,
     inverse_depth: torch.Tensor | None,
     temperature: float = 1.0,
     near_bias: float = 0.0,
-    background_logit: float = 0.0,
     top_k: int = 2,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Turn capture scores into a small set of coherent votes per ray.
 
-    Every sample along a ray competes for one consensus vote, and a fixed
-    background slot absorbs rays with no confident surface. Keeping only the
-    top-k sample votes and renormalizing them prevents many small opacity
-    layers from averaging colors into fog. This is what makes late training
-    converge on a surface instead of oscillating between diffuse shells.
+    Every sample along a ray competes for one consensus vote. The scene is
+    one continuous volume with many possible depth layers; there is no
+    separate background slot. Keeping only the top-k sample votes and
+    renormalizing them prevents many small opacity layers from averaging
+    colors into fog.
     """
-    temperature = max(float(temperature), 1e-3)
+    temperature = max(float(temperature), 0.25)
     scores = capture_logit[..., 0] / temperature
     if float(near_bias) > 0.0 and inverse_depth is not None:
         inv = inverse_depth.float()
@@ -502,24 +531,10 @@ def _consensus_weights(
         inv_max = inv.max(dim=1, keepdim=True).values
         near_norm = (inv - inv_min) / (inv_max - inv_min + 1e-6)
         scores = scores + float(near_bias) * near_norm
-    bg = torch.full_like(
-        scores[:, :1],
-        float(background_logit) / temperature,
-    )
-    all_scores = torch.cat([scores, bg], dim=1)
-    probs = torch.softmax(all_scores, dim=1)
-    sample_weights = probs[:, :-1].unsqueeze(-1)
-    bg_weight = probs[:, -1:].unsqueeze(-1)
-    top_k = max(0, int(top_k))
-    if top_k > 0 and sample_weights.shape[1] > top_k:
-        flat = sample_weights[..., 0]
-        top_values, top_indices = torch.topk(flat, top_k, dim=1)
-        selected = torch.zeros_like(flat)
-        selected.scatter_(1, top_indices, top_values)
-        sample_weights = (
-            selected / selected.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        ).unsqueeze(-1)
-    return sample_weights, bg_weight
+    probs = torch.softmax(scores, dim=1)
+    sample_weights = probs.unsqueeze(-1)
+    sample_weights = _soft_top_k(sample_weights, int(top_k))
+    return sample_weights
 
 
 def _voting_weights(
@@ -595,40 +610,40 @@ def _voting_weights(
     return weights
 
 
-def _peak_render_weights(
-    weights: torch.Tensor,
+def _visible_topk_render_weights(
+    consensus_weights: torch.Tensor,
+    alpha: torch.Tensor,
+    physical_weights: torch.Tensor,
     peak_power: float,
-    inverse_depth: torch.Tensor | None = None,
-    window_width: float = 2.2,
+    top_k: int,
 ) -> torch.Tensor:
-    """Sharpen the final color vote around the dominant sample.
+    """Scale consensus votes by physical visibility, then keep the top-k.
 
-    The sharpened vote is additionally windowed around the current peak in
-    inverse-depth space. The peak index is detached, so the optimizer only
-    has to move the sample votes that are already near the winner; it never
-    has to differentiate through a discrete winner switch.
+    A ray is one continuous scene path: physical alpha tells which depth
+    layers are actually visible, and the consensus vote decides which of
+    those visible layers best explain the color. Samples hidden behind an
+    opaque layer no longer compete for the color vote, so a multi-object
+    scene composites front-to-back instead of averaging unrelated layers.
+
+    The forward pass keeps exactly one winning sample (top-1) so a pixel is
+    explained by a single surface color instead of a foggy average. The
+    backward pass substitutes a soft vote so the color loss can move which
+    sample wins; a hard argmax normalization has no gradient at all and
+    leaves the vote frozen at whatever depth the geometry terms happened to
+    prefer.
     """
+    visible = consensus_weights * physical_weights
+    visible = visible / visible.sum(dim=1, keepdim=True).clamp(min=1e-6)
+    visible = _soft_top_k(visible, int(top_k))
     if float(peak_power) <= 1.0:
-        return weights
-    peak_scale = weights.max(dim=1, keepdim=True).values.clamp(min=1e-6)
-    surface = (weights / peak_scale).clamp(min=0.0) ** float(peak_power)
-    if inverse_depth is not None:
-        peak_index = weights.max(dim=1).indices
-        peak_inverse = inverse_depth.gather(1, peak_index)
-        if inverse_depth.shape[1] > 1:
-            spacing = (inverse_depth[:, 1:] - inverse_depth[:, :-1]).abs()
-            median_spacing = torch.median(spacing, dim=1, keepdim=True).values
-            bandwidth = median_spacing * float(window_width)
-        else:
-            bandwidth = torch.ones_like(inverse_depth[:, :1]) * 1e-3
-        distance = (inverse_depth - peak_inverse).abs()
-        window = torch.exp(
-            -0.5
-            * (distance / bandwidth.clamp(min=1e-4)) ** 2
-            * float(peak_power)
-        )
-        surface = surface * window.unsqueeze(-1)
-    return surface / surface.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        return visible
+    peak_scale = visible.max(dim=1, keepdim=True).values.clamp(min=1e-6)
+    surface = (visible / peak_scale).clamp(min=0.0) ** float(peak_power)
+    hard = torch.zeros_like(surface)
+    max_index = surface.argmax(dim=1, keepdim=True)
+    hard.scatter_(1, max_index, 1.0)
+    soft = surface / surface.sum(dim=1, keepdim=True).clamp(min=1e-6)
+    return hard + soft - soft.detach()
 
 
 def _sample_rays(
@@ -967,6 +982,7 @@ def render_rays_chunk(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
 ]:
     """Render a batch of rays with coherence voting.
 
@@ -1069,12 +1085,11 @@ def render_rays_chunk(
                 logit_floor=float(model.logit_floor),
                 logit_floor_slope=float(model.logit_floor_slope),
             )
-            sampling_weights, _ = _consensus_weights(
+            sampling_weights = _consensus_weights(
                 coarse_capture_logit,
                 coarse_inverse,
                 float(model.consensus_temperature),
                 near_bias=0.0,
-                background_logit=float(model.consensus_background_logit),
                 top_k=4,
             )
 
@@ -1147,29 +1162,36 @@ def render_rays_chunk(
             logit_floor=float(model.logit_floor),
             logit_floor_slope=float(model.logit_floor_slope),
         )
-        consensus_weights, bg_weight = _consensus_weights(
+        consensus_weights = _consensus_weights(
             capture_logit,
             fine_inverse,
             float(model.consensus_temperature),
             near_bias=model.consensus_near_bias,
-            background_logit=model.consensus_background_logit,
             top_k=model.consensus_top_k,
         )
-        render_weights = _peak_render_weights(
+        render_weights = _visible_topk_render_weights(
             consensus_weights,
+            sample_alpha,
+            weights,
             float(model.peak_power),
-            fine_inverse,
-            window_width=float(model.peak_render_window),
+            int(model.render_top_k),
         )
         color = torch.sum(render_weights * sample_colors, dim=1)
-        # Physical transparency decides how much of the ray is empty, and
-        # the consensus background vote clears rays with no confident
-        # surface. This keeps background rays from inheriting object fog.
+        # If every visible vote is suppressed (for example an entirely
+        # transparent ray), fall back to the physical composite color so a
+        # partially visible ray never turns black before exit blending.
+        vote_total = render_weights.sum(dim=1)
+        color = torch.where(
+            vote_total > 1e-6,
+            color,
+            torch.sum(weights * sample_colors, dim=1),
+        )
+        # Physical transparency decides how much of the ray is empty. The
+        # scene is continuous: rays with opacity keep the surface vote, and
+        # only truly empty rays fall back to the scene exit color.
         alpha_visibility = weights.sum(dim=1).clamp(max=1.0)
         physical_color = torch.sum(weights * sample_colors, dim=1)
-        visibility = (
-            alpha_visibility * (1.0 - bg_weight[..., 0])
-        ).clamp(0.0, 1.0)
+        visibility = alpha_visibility.clamp(0.0, 1.0)
         background = model.background.to(color.dtype)
         rendered = color * visibility + background * (1.0 - visibility)
         physical_rendered = (
@@ -1193,8 +1215,8 @@ def render_rays_chunk(
             coarse_rendered,
             sample_gates,
             consensus_weights,
-            bg_weight,
             physical_rendered,
+            color,
         )
     return rendered
 
@@ -1313,12 +1335,11 @@ def render_rays_chunk_geometry(
                 logit_floor=float(model.logit_floor),
                 logit_floor_slope=float(model.logit_floor_slope),
             )
-            sampling_weights, _ = _consensus_weights(
+            sampling_weights = _consensus_weights(
                 coarse_capture_logit,
                 coarse_inverse,
                 float(model.consensus_temperature),
                 near_bias=0.0,
-                background_logit=float(model.consensus_background_logit),
                 top_k=4,
             )
 
@@ -1359,7 +1380,7 @@ def render_rays_chunk_geometry(
         )
         sample_colors = torch.sigmoid(fine_logits[..., 0:3])
         fine_segments = _segment_lengths(fine_positions, fine_inverse)
-        weights = _voting_weights(
+        weights, sample_alpha = _voting_weights(
             fine_logits[..., 3:4],
             fine_logits[..., 4:5],
             temperature,
@@ -1373,6 +1394,7 @@ def render_rays_chunk_geometry(
             alpha_scale=alpha_scale,
             capture_floor=float(model.capture_floor),
             logit_clamp=float(model.logit_clamp),
+            return_alpha=True,
         )
         capture_logit = _capture_logit(
             fine_logits[..., 3:4],
@@ -1388,19 +1410,19 @@ def render_rays_chunk_geometry(
             logit_floor=float(model.logit_floor),
             logit_floor_slope=float(model.logit_floor_slope),
         )
-        consensus_weights, bg_weight = _consensus_weights(
+        consensus_weights = _consensus_weights(
             capture_logit,
             fine_inverse,
             float(model.consensus_temperature),
             near_bias=model.consensus_near_bias,
-            background_logit=model.consensus_background_logit,
             top_k=model.consensus_top_k,
         )
-        render_weights = _peak_render_weights(
+        render_weights = _visible_topk_render_weights(
             consensus_weights,
+            sample_alpha,
+            weights,
             float(model.peak_power),
-            fine_inverse,
-            window_width=float(model.peak_render_window),
+            int(model.render_top_k),
         )
         color = torch.sum(render_weights * sample_colors, dim=1)
         weights_sum = render_weights.sum(dim=1).clamp(min=1e-6)
@@ -1408,9 +1430,7 @@ def render_rays_chunk_geometry(
             render_weights * fine_positions, dim=1
         ) / weights_sum
         alpha_visibility = weights.sum(dim=1).clamp(max=1.0)
-        visibility = (
-            alpha_visibility * (1.0 - bg_weight[..., 0])
-        ).clamp(0.0, 1.0)
+        visibility = alpha_visibility.clamp(0.0, 1.0)
         background = model.background.to(color.dtype)
         rendered = color * visibility + background * (1.0 - visibility)
     return rendered, expected_position, visibility
@@ -1538,6 +1558,40 @@ def _scene_transform(
     if not np.isfinite(radius) or radius <= 1e-6:
         radius = 1.0
     return torch.tensor(shift, dtype=torch.float32), radius
+
+
+def _scene_exit_color(images: list[np.ndarray]) -> list[float]:
+    """Physical far-field color for rays that leave the reconstructed volume.
+
+    Bounded scene datasets contain scene content everywhere, so this is only
+    a weak prior for genuinely empty rays; the optimizer can move it and the
+    volume material fills the actual image regions. The estimate blends the
+    image border and the whole-view statistics so neither a borderless scene
+    nor an open scene is forced into a foreground/background dichotomy.
+    """
+    border_samples: list[np.ndarray] = []
+    view_samples: list[np.ndarray] = []
+    for image in images:
+        height, width = image.shape[:2]
+        border = np.concatenate(
+            [
+                image[0, :, :],
+                image[-1, :, :],
+                image[:, 0, :],
+                image[:, -1, :],
+            ],
+            axis=0,
+        )
+        border_samples.append(border)
+        view_samples.append(image.reshape(-1, 3))
+    if not border_samples:
+        return [0.5, 0.5, 0.5]
+    border_pixels = np.concatenate(border_samples, axis=0)
+    view_pixels = np.concatenate(view_samples, axis=0)
+    border_color = np.median(border_pixels.reshape(-1, 3), axis=0)
+    view_color = np.median(view_pixels.reshape(-1, 3), axis=0)
+    exit_color = 0.6 * border_color + 0.4 * view_color
+    return [float(exit_color[0]), float(exit_color[1]), float(exit_color[2])]
 
 
 def _ray_bounds(
@@ -1847,6 +1901,20 @@ def train_tcf(
         torch.cuda.manual_seed_all(seed)
 
     model = TitanCoherenceField(config).to(device)
+    view_images = (
+        [images[index] for index in range(images.shape[0])]
+        if isinstance(images, np.ndarray)
+        else list(images)
+    )
+    with torch.no_grad():
+        exit_color = torch.tensor(
+            _scene_exit_color(view_images),
+            dtype=torch.float32,
+            device=device,
+        )
+        model.background.copy_(exit_color)
+        model.background_target.copy_(exit_color)
+    log(f"[tcf] 场景远场颜色 {exit_color.cpu().tolist()}")
     scene_points = (
         np.asarray(sparse_points, dtype=np.float32)[:, :3]
         if sparse_points is not None and len(sparse_points)
@@ -1880,28 +1948,20 @@ def train_tcf(
     lr_end = float(config.get("learning_rate_end", 0.002))
     use_amp = bool(config.get("mixed_precision", True))
     background_weight = float(config.get("background_weight", 0.1))
-    occupancy_weight = float(config.get("occupancy_regularization", 0.01))
+    occupancy_weight = float(config.get("occupancy_regularization", 0.002))
     visibility_weight = float(config.get("visibility_regularization", 0.02))
-    background_slot_weight = float(
-        config.get("background_slot_regularization", 0.1)
-    )
     visibility_target_min = float(
-        config.get("visibility_target_min", 0.9)
+        config.get("visibility_target_min", 0.75)
     )
     visibility_target_max = float(
-        config.get("visibility_target_max", 1.0)
+        config.get("visibility_target_max", 0.95)
     )
     visibility_upper_cap = float(config.get("visibility_upper_cap", 1.0))
     visibility_upper_weight = float(
         config.get("visibility_upper_regularization", 0.0)
     )
-    background_slot_cap = float(config.get("background_slot_cap", 0.25))
-    background_slot_cap_weight = float(
-        config.get("background_slot_cap_regularization", 0.0)
-    )
-    background_bonus_weight = float(
-        config.get("background_bonus_regularization", 0.05)
-    )
+    hole_weight = float(config.get("hole_regularization", 0.25))
+    winner_color_weight = float(config.get("winner_color_regularization", 1.0))
     consensus_entropy_weight = float(
         config.get("consensus_entropy_regularization", 0.02)
     )
@@ -1916,6 +1976,10 @@ def train_tcf(
     depth_sigma = float(config.get("depth_sigma", 0.1))
     surface_weight = float(config.get("surface_regularization", 1.0))
     peak_weight = float(config.get("peak_regularization", 0.6))
+    surface_alpha_weight = float(
+        config.get("surface_alpha_regularization", 0.6)
+    )
+    surface_alpha_target = float(config.get("surface_alpha_target", 0.85))
     surface_density = float(config.get("surface_density", 5.0))
     surface_density_weight = float(
         config.get("surface_density_regularization", 0.0)
@@ -1969,6 +2033,7 @@ def train_tcf(
     rng = np.random.default_rng(training_seed)
     history: list[dict] = []
     start_wall = time.time()
+    loss_ema: float | None = None
 
     scene_points_t = (
         torch.from_numpy(
@@ -2122,6 +2187,11 @@ def train_tcf(
         target = torch.tensor(
             image[ys, xs].astype(np.float32), device=device, dtype=torch.float32
         )
+        target_luminance = (
+            0.2126 * target[..., 0:1]
+            + 0.7152 * target[..., 1:2]
+            + 0.0722 * target[..., 2:3]
+        )
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
@@ -2136,8 +2206,8 @@ def train_tcf(
                 coarse_rendered,
                 sample_gates,
                 consensus_weights,
-                bg_weight,
                 physical_rendered,
+                color,
             ) = render_rays_chunk(
                 model,
                 origins_scaled,
@@ -2159,11 +2229,12 @@ def train_tcf(
                 * directions.unsqueeze(1),
                 dim=-1,
             )
-            render_weights = _peak_render_weights(
+            render_weights = _visible_topk_render_weights(
                 consensus_weights,
+                sample_alpha,
+                weights,
                 float(model.peak_power),
-                (1.0 / sample_depths.clamp(min=1e-6)),
-                window_width=float(model.peak_render_window),
+                int(model.render_top_k),
             )
             consensus_vote = render_weights[..., 0]
             weights_sum = consensus_vote.sum(dim=1).clamp(min=1e-6)
@@ -2187,6 +2258,7 @@ def train_tcf(
                 sample_alpha[..., 0] * (1.0 - scaffold_values)
             )
             color_loss = torch.mean((rendered - target) ** 2)
+            winner_color_loss = torch.mean((color - target) ** 2)
             coarse_color_loss = torch.mean((coarse_rendered - target) ** 2)
             physical_color_loss = torch.mean(
                 (physical_rendered - target) ** 2
@@ -2194,22 +2266,28 @@ def train_tcf(
             occupancy_penalty = torch.mean(
                 sample_alpha * (1.0 - sample_alpha)
             )
+            alpha_visibility = weights.sum(dim=1).clamp(max=1.0)
+            bright_mask = (target_luminance > 0.25).to(rendered.dtype)
+            visibility_deficit = torch.relu(
+                visibility_target - alpha_visibility
+            )
+            hole_penalty = torch.mean(
+                hit_mask * bright_mask * visibility_deficit**2
+            )
+            alpha_peak = sample_alpha.max(dim=1).values[..., 0]
+            surface_alpha_penalty = torch.mean(
+                hit_mask
+                * depth_confidence
+                * torch.relu(surface_alpha_target - alpha_peak) ** 2
+            )
             visibility_penalty = torch.mean(
                 hit_mask * torch.relu(visibility_target - visibility) ** 2
-                + (1.0 - hit_mask) * visibility**2
             )
             visibility_upper_penalty = torch.mean(
                 hit_mask
                 * torch.relu(visibility - visibility_upper_cap) ** 2
             )
             weights_norm = consensus_vote / weights_sum.unsqueeze(1)
-            bg_conf = bg_weight[..., 0]
-            background_slot_penalty = torch.mean(
-                torch.relu(bg_conf - background_slot_cap) ** 2
-                + background_bonus_weight
-                * (1.0 - hit_mask)
-                * torch.relu(1.0 - bg_conf) ** 2
-            )
             raw_consensus = consensus_weights[..., 0]
             sharpness_penalty = torch.mean(
                 hit_mask * (1.0 - raw_consensus.max(dim=1).values)
@@ -2305,19 +2383,19 @@ def train_tcf(
             )
             loss = (
                 color_loss
+                + winner_color_weight * winner_color_loss
                 + coarse_color_weight * coarse_color_loss
                 + physical_color_scale * physical_color_loss
                 + occupancy_weight * occupancy_penalty
+                + hole_weight * hole_penalty
                 + visibility_weight * visibility_penalty
                 + visibility_upper_weight * visibility_upper_penalty
-                + background_slot_weight * background_slot_penalty
-                + background_slot_cap_weight
-                * background_slot_penalty
                 + reg_scale * sharpness_weight * sharpness_penalty
                 + reg_scale * consensus_entropy_weight * entropy_penalty
                 + reg_scale * consensus_margin_weight * consensus_margin_penalty
                 + reg_scale * geometry_weight * geometry_scale * geometry_penalty
                 + reg_scale * peak_weight * geometry_scale * peak_penalty
+                + reg_scale * surface_alpha_weight * geometry_scale * surface_alpha_penalty
                 + reg_scale * scaffold_weight * geometry_scale * scaffold_penalty
                 + reg_scale * depth_dist_weight * geometry_scale * depth_dist_penalty
                 + reg_scale * density_floor_weight * density_floor_penalty
@@ -2335,7 +2413,7 @@ def train_tcf(
                 "coarse_rendered": coarse_rendered,
                 "sample_gates": sample_gates,
                 "consensus_weights": consensus_weights,
-                "bg_weight": bg_weight,
+                "color": color,
             }
             bad = [
                 name
@@ -2346,16 +2424,17 @@ def train_tcf(
                 f"[tcf] non-finite loss at step {step} "
                 f"loss={float(loss)} bad={bad} "
                 f"color={float(color_loss):.6f} "
+                f"winner={float(winner_color_loss):.6f} "
                 f"coarse={float(coarse_color_loss):.6f} "
                 f"occ={float(occupancy_penalty):.6f} "
                 f"vis={float(visibility_penalty):.6f} "
-                f"bslot={float(background_slot_penalty):.6f} "
                 f"sharp={float(sharpness_penalty):.6f} "
                 f"entropy={float(entropy_penalty):.6f} "
                 f"margin={float(consensus_margin_penalty):.6f} "
                 f"geo={float(geometry_penalty):.6f} "
                 f"peak={float(peak_penalty):.6f} "
                 f"scaf={float(scaffold_penalty):.6f} "
+                f"salpha={float(surface_alpha_penalty):.6f} "
                 f"dist={float(depth_dist_penalty):.6f} "
                 f"dfloor={float(density_floor_penalty):.6f} "
                 f"sdfd={float(surface_density_penalty):.6f}"
@@ -2382,18 +2461,24 @@ def train_tcf(
         optimizer.step()
         scheduler.step()
 
-        loss_value = float(loss.detach().cpu())
+        raw_loss_value = float(loss.detach().cpu())
+        if loss_ema is None:
+            loss_ema = raw_loss_value
+        else:
+            loss_ema = 0.97 * loss_ema + 0.03 * raw_loss_value
+        loss_value = loss_ema
         if os.environ.get("TITAN_DEBUG") and step % 10 == 0:
             with torch.no_grad():
                 log(
                     "[tcf:dbg] step {} hit {:.3f} vis {:.3f} alpha {:.4f} "
-                    "ed {:.3f} td {:.3f} loss c {:.5f} occ {:.6f} "
-                    "visp {:.6f} bslot {:.6f} sharp {:.6f} "
+                    "ed {:.3f} td {:.3f} loss c {:.5f} win {:.5f} hole {:.6f} "
+                    "occ {:.6f} "
+                    "visp {:.6f} sharp {:.6f} "
                     "entropy {:.6f} margin {:.6f} geo {:.6f} "
                     "peak {:.6f} "
-                    "scaf {:.6f} dist {:.6f} dfloor {:.6f} "
-                    "sdfd {:.6f} conf {:.3f} gate {:.3f} bg {:.3f} "
-                    "floor {:.3f} cwmax {:.3f} bgw {:.3f} "
+                    "scaf {:.6f} salpha {:.6f} dist {:.6f} dfloor {:.6f} "
+                    "sdfd {:.6f} conf {:.3f} gate {:.3f} "
+                    "floor {:.3f} cwmax {:.3f} "
                     "ctemp {:.3f}".format(
                         step,
                         float(hit_mask.mean()),
@@ -2402,9 +2487,10 @@ def train_tcf(
                         float(expected_depth.mean()),
                         float(target_depth.mean()),
                         float(color_loss),
+                        float(winner_color_loss),
+                        float(hole_penalty),
                         float(occupancy_penalty),
                         float(visibility_penalty),
-                        float(background_slot_penalty),
                         float(visibility_upper_penalty),
                         float(sharpness_penalty),
                         float(entropy_penalty),
@@ -2412,6 +2498,7 @@ def train_tcf(
                         float(geometry_penalty),
                         float(peak_penalty),
                         float(scaffold_penalty),
+                        float(surface_alpha_penalty),
                         float(depth_dist_penalty),
                         float(density_floor_penalty),
                         float(surface_density_penalty),
@@ -2422,7 +2509,6 @@ def train_tcf(
                         float(
                             consensus_weights.max(dim=1).values.mean()
                         ),
-                        float(bg_weight.mean()),
                         float(model.consensus_temperature),
                     )
                 )
@@ -2435,6 +2521,7 @@ def train_tcf(
                 "step": step,
                 "totalSteps": steps,
                 "loss": loss_value,
+                "lossRaw": raw_loss_value,
                 "vramMB": _device_reserved_mb(),
                 "latticeMB": model.lattice_mb(),
             }
@@ -2555,6 +2642,12 @@ def render_tcf_view(
     origins_scaled = (origins - shift) * scale
     near, far = _ray_bounds(origins_scaled, scene_points, radius, scale, shift)
     with torch.no_grad():
+        if os.environ.get("TITAN_DBG_MEM"):
+            log(
+                f"[tcf:mem] view rays {origins_scaled.shape[0]} "
+                f"alloc {torch.cuda.memory_allocated() / 2**20:.0f} MiB "
+                f"reserved {torch.cuda.memory_reserved() / 2**20:.0f} MiB"
+            )
         rendered = render_rays(
             model,
             origins_scaled,
@@ -2569,6 +2662,11 @@ def render_tcf_view(
             depth_tolerance=depth_tolerance,
             anchor_spread=anchor_spread,
         )
+        if os.environ.get("TITAN_DBG_MEM"):
+            log(
+                f"[tcf:mem] view done alloc {torch.cuda.memory_allocated() / 2**20:.0f} MiB "
+                f"reserved {torch.cuda.memory_reserved() / 2**20:.0f} MiB"
+            )
     image = rendered.detach().cpu().numpy()
     height, width = int(camera["height"]), int(camera["width"])
     return image.reshape(height, width, 3)

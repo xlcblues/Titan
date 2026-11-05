@@ -1,11 +1,11 @@
 {
-  "version": "0.2.1",
-  "notes": "fern 评测确认的 TCF 算法优化：收敛更稳定，eval PSNR 17.15 / SSIM 0.427；默认长训练配置与 peak 采样",
-  "pub_date": "2026-11-04T11:02:37.428Z",
+  "version": "0.3.0",
+  "notes": "TCF 连续场景重构：移除固定背景槽，可导 top-k 深度选择驱动颜色损失；新增空洞与表面 alpha 正则；lattice 容量提升，8GB 显存内稳定训练",
+  "pub_date": "2026-11-05T11:19:00.821Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUajRKTVc1c3JXdjVFN3ZCOTNGOC9OYlZLM3VaUUFlRVZOcGZUanBkelM1T21HMnFWZ2FxZ3RMYVBBZEZUUUZUaUJ4U0V2NnVGbnhQSFh6WkxlZVhHQkwvNU9Qdy9zNEFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNzkwMTU3CWZpbGU6VGl0YW5fMC4yLjFfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMi4xClN5QW5UWlVaWFJlQ2VDWE04NVVhdzFvRVBzQ3hrcDhWNGRiTXZPYllHbzhQZm1pYVJlWW5GTE8vdnRvWGNPZnNvNG5PeUkzaTc1VlYwUVh0MTdaekFRPT0K",
-      "url": "https://github.com/xlcblues/Titan/releases/download/v0.2.1/Titan_0.2.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUajRKTVc1c3JXdjlHc3VqUmxLdk4zNUpUYmsvakFBS25PTWtTU2wvbVNhcU1iNHBOTlFCTnU0RE9SZmhrZWlKVGpoQ0ZwM1FkSy9tS3pjTlM0UU5wN290ZmN0cWlMbndRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzODc3NTQwCWZpbGU6VGl0YW5fMC4zLjBfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMy4wCnpVNFBjUER5YUZjbEJRZEtibmZLRXZ0b0sxc3pKWWJEVWk1R0xNVFREK2FhVHFrZlpyTmpBeXlYSldZTnkxVURacXU0YlhoQXVONzdGTG5NTzRHaUFRPT0K",
+      "url": "https://github.com/xlcblues/Titan/releases/download/v0.3.0/Titan_0.3.0_x64-setup.exe"
     }
   }
 }
